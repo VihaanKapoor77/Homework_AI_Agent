@@ -10,7 +10,11 @@ to install python run
 ```powershell
 winget install -e --id Python.Python.3.12
 ```
-and to setup the agent run
+
+1st, download this zip
+
+Then, to set up the agent, run
+
 
 ```powershell
 py -3.12 -m venv .venv
