@@ -1,0 +1,10 @@
+{
+  "scope": "local exact-math solver only; no Gemini, screenshots, or live DeltaMath tested",
+  "cases": 241,
+  "correct": 241,
+  "accuracy_percent": 100.0,
+  "median_ms": 0.759,
+  "p95_ms": 3.861,
+  "total_seconds": 0.276,
+  "failures": []
+}

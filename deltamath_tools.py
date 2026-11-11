@@ -1,0 +1,218 @@
+"""DeltaMath helpers: inspect visible math, target discovered fields, read back input.
+No private site APIs or guessed internal question/answer schemas are used.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import re
+import uuid
+from urllib.parse import urlsplit
+from settings import ACTION_MS, READY_MS
+from math_keyboard import enter_keyboard
+from playwright.async_api import Error as PlaywrightError
+
+
+def is_deltamath(url: str) -> bool:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or '').lower()
+    return parsed.scheme == 'https' and (host == 'deltamath.com' or host.endswith('.deltamath.com'))
+
+
+def normalize_latex(value: str) -> str:
+    # Formatting-only comparison, NOT proof of mathematical equivalence.
+    return re.sub(r'\s+', '', value.replace(r'\left', '').replace(r'\right', ''))
+
+
+READ_PAGE = r'''({scope, prefix, assign}) => {
+    const main = document.querySelectorAll('main, [role="main"]');
+    const roots = scope === 'auto' ? (main.length === 1 ? main : [document.body]) : document.querySelectorAll(scope);
+    if (roots.length !== 1) throw Error('Question scope must match exactly one element');
+    const root = roots[0];
+    const visible = el => !!el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+    const MQ = window.MathQuill && typeof window.MathQuill.getInterface === 'function'
+        ? window.MathQuill.getInterface(2) : null;
+    const apiFor = el => { try { return typeof MQ === 'function' ? MQ(el) : null; } catch { return null; } };
+    const label = el => el.getAttribute('aria-label') ||
+        (el.labels ? [...el.labels].map(x => x.textContent).join(' ') : '') ||
+        el.getAttribute('placeholder') || '';
+    const math = [...root.querySelectorAll('.mq-math-mode, .katex, math, [data-latex]')]
+        .filter(el => visible(el) && !el.closest('#answer-block, .mq-editable-field, [contenteditable="true"]'))
+        .slice(0, 60).map(el => {
+            const api = apiFor(el);
+            const annotation = el.querySelector('annotation[encoding="application/x-tex"]');
+            return {latex: api && typeof api.latex === 'function' ? api.latex() :
+                el.getAttribute('data-latex') || (annotation ? annotation.textContent : null),
+                accessible: el.getAttribute('aria-label'),
+                mathml: el.tagName.toLowerCase() === 'math' ? el.outerHTML.slice(0, 2000) : null,
+                rendered: (el.textContent || '').slice(0, 1000)};
+        });
+    const fields = [...root.querySelectorAll('.mq-editable-field, input, textarea, select, [contenteditable="true"]')]
+        .filter(el => visible(el) && !el.disabled && !el.readOnly &&
+            !['password','hidden','checkbox','radio','submit','button'].includes(el.type) &&
+            (el.classList.contains('mq-editable-field') || !el.closest('.mq-editable-field')))
+        .slice(0, 30).map((el, i) => {
+            const id = prefix + '-field-' + i;
+            if (assign) el.setAttribute('data-dm-agent', id);
+            const api = apiFor(el);
+            return {id, selector: '[data-dm-agent="' + id + '"]', label: label(el), kind: el.classList.contains('mq-editable-field') ? 'mathquill' : (el.tagName === 'SELECT' ? 'select' : 'text'), options: el.tagName === 'SELECT' ? [...el.options].map(x=>({label:x.label,value:x.value})).slice(0,30) : [],
+                has_mathquill_api: !!api, value: api && typeof api.latex === 'function' ? api.latex() :
+                    ('value' in el ? el.value : el.innerText)};
+        });
+    const buttons = [...root.querySelectorAll('button, a, [role="button"], input[type="submit"]')]
+        .filter(visible).slice(0, 50).map((el, i) => {
+            const id = prefix + '-button-' + i;
+            if (assign) el.setAttribute('data-dm-agent', id);
+            return {id, selector: '[data-dm-agent="' + id + '"]', text: label(el) || (el.innerText || el.value || '').slice(0, 150), disabled: !!el.disabled};
+        });
+    const ignored = 'script, style, input, textarea, button, [role="button"], select, '
+        + '#answer-block, .mq-editable-field, [contenteditable="true"], [role="alert"], [role="status"], [aria-live]';
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const pieces = [];
+    let node;
+    while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (parent && !parent.closest(ignored) && visible(parent)) pieces.push(node.textContent);
+    }
+    const question_text = pieces.join(' ').replace(/\s+/g, ' ').trim();
+    const images = [...root.querySelectorAll('img, canvas, svg[role="img"]')].filter(visible).slice(0, 15)
+        .map(el => ({tag: el.tagName, alt: el.getAttribute('alt') || el.getAttribute('aria-label') || '',
+            src: el.tagName === 'IMG' ? el.getAttribute('src') : null}));
+    const feedback = [...document.querySelectorAll('[role="alert"], [role="status"], [aria-live]:not([aria-live="off"])')]
+        .filter(visible).map(el => (el.innerText || '').trim()).filter(Boolean).slice(0, 15);
+    return {url: location.href, question_text: question_text.slice(0, 14000), math, fields, buttons,
+        images, feedback, visible_text: (root.innerText || '').slice(0, 14000),
+        truncated: question_text.length > 14000};
+}'''
+
+READ_FIELD = r'''el => {
+    if (el.classList.contains('mq-editable-field')) {
+        const MQ = window.MathQuill && typeof window.MathQuill.getInterface === 'function' ? window.MathQuill.getInterface(2) : null;
+        const field = typeof MQ === 'function' ? MQ(el) : null;
+        return {kind: 'mathquill', latex: field && typeof field.latex === 'function' ? field.latex() : null, text: el.innerText};
+    }
+    if (el.tagName === 'SELECT') return {kind:'select',value:el.value,label:el.selectedOptions[0]?.label || ''};
+    return {kind: 'text', value: 'value' in el ? el.value : el.innerText};
+}'''
+
+WRITE_MATH = r'''(el, latex) => {
+    const MQ = window.MathQuill && typeof window.MathQuill.getInterface === 'function' ? window.MathQuill.getInterface(2) : null;
+    const field = typeof MQ === 'function' ? MQ(el) : null;
+    if (!field || !['write','latex','focus'].every(name=>typeof field[name]==='function'))
+        return {written:false};
+    // Use the existing public editor API, never construct a new field or edit its innerHTML.
+    field.focus();
+    field.latex('');
+    if (field.latex() !== '') throw Error('Editor did not clear; stopping before typing');
+    field.write(latex);
+    return {written:true, latex:field.latex()};
+}'''
+
+
+class DeltaMathTools:
+    def __init__(self, scope: str = 'auto'):
+        self.scope = scope
+        self.latest = None
+        self.ready_timeout_ms = READY_MS
+
+    async def inspect(self, page, *, assign=True):
+        if not is_deltamath(page.url):
+            raise ValueError('Open an HTTPS DeltaMath page first.')
+        prefix = uuid.uuid4().hex[:12] if assign else (self.latest or {}).get('token', '')
+        # Poll visible content, not networkidle: background requests need not finish.
+        deadline = asyncio.get_running_loop().time() + self.ready_timeout_ms / 1000
+        previous = None
+        last_error = None
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(f'DeltaMath readiness deadline reached; last detail: {last_error or "page content remained empty or changing"}')
+            try:
+                data = await asyncio.wait_for(page.evaluate(READ_PAGE, dict(scope=self.scope, prefix=prefix, assign=False)), timeout=remaining)
+                if not assign:
+                    break
+                identity = json.dumps([data['question_text'], data['math'], data['images'],
+                                       [(f['kind'], f['label']) for f in data['fields']]], sort_keys=True)
+                if data['visible_text'].strip() and identity == previous:
+                    data = await asyncio.wait_for(page.evaluate(READ_PAGE, dict(scope=self.scope, prefix=prefix, assign=True)), timeout=max(.01, deadline-asyncio.get_running_loop().time()))
+                    break
+                previous = identity
+            except PlaywrightError as exc:
+                if page.is_closed() or not is_deltamath(page.url):
+                    raise
+                # Navigation can destroy the execution context; invalid selectors are not transient.
+                if not any(text in str(exc).lower() for text in ('execution context', 'navigation', 'context was destroyed')):
+                    raise
+                last_error = str(exc)[:250]
+            await asyncio.sleep(min(.12, max(0, deadline-asyncio.get_running_loop().time())))
+        if not is_deltamath(data['url']):
+            raise ValueError('Page navigated away from DeltaMath.')
+        # Includes equation markup and image identity, not changing answer-field contents.
+        signature = hashlib.sha256(json.dumps([data['url'], data['question_text'], data['math'], data['images']],
+                                             sort_keys=True).encode()).hexdigest()
+        if assign:
+            self.latest = dict(token=prefix, page=page, signature=signature, fields=data['fields'], entered={})
+            data['snapshot_token'] = prefix
+        data['signature'] = signature
+        data['instructions'] = (
+            'Read the full instructions, exact/decimal requirement, units and rounding. '
+            'Use math latex rather than flattened text. Inspect images visually when needed. '
+            'DeltaMath log means base 10: use log10 in the solver; ln means natural log. '
+            'Fields and buttons are discovered live; do not guess selectors. '
+            'A readback match only checks entry, not correctness or acceptance by the website.'
+        )
+        return data
+
+    async def enter(self, page, snapshot_token: str, field_id: str, answer: str, format: str = 'latex'):
+        if not self.latest or self.latest['page'] is not page or snapshot_token != self.latest['token']:
+            raise ValueError('Stale snapshot. Read the question again before entering an answer.')
+        if not isinstance(answer, str) or not answer.strip() or len(answer) > 2000:
+            raise ValueError('Answer must contain 1-2000 characters.')
+        if format not in ('latex', 'text'):
+            raise ValueError('format must be latex or text.')
+        field = next((f for f in self.latest['fields'] if f['id'] == field_id), None)
+        if field is None:
+            raise ValueError('Use a field_id returned by the latest DeltaMath snapshot.')
+        fresh = await self.inspect(page, assign=False)
+        if fresh['signature'] != self.latest['signature']:
+            raise ValueError('Question changed. Read and solve it again.')
+        locator = page.locator(f'[data-dm-agent="{field_id}"]')
+        if await locator.count() != 1 or not await locator.is_visible():
+            raise ValueError('Answer field changed or disappeared. Take a new snapshot.')
+        used_keyboard = False
+        if field['kind'] == 'mathquill':
+            if format != 'latex':
+                raise ValueError(r'MathQuill field requires LaTeX, for example \frac{1}{2}.')
+            if field.get('has_mathquill_api'):
+                written = await locator.evaluate(WRITE_MATH, answer, timeout=5000)
+                if not written.get('written'):
+                    await enter_keyboard(locator, answer, 5000)
+                    used_keyboard = True
+            else:
+                await enter_keyboard(locator, answer, 5000)
+                used_keyboard = True
+        elif field['kind'] == 'select':
+            if format != 'text':
+                raise ValueError('Dropdown options require plain text labels.')
+            matches=[o for o in field.get('options',[]) if o['label'].strip()==answer.strip()]
+            if len(matches)!=1:
+                raise ValueError('Dropdown answer did not match one unique visible option.')
+            await locator.select_option(label=answer,timeout=ACTION_MS)
+        else:
+            if format != 'text':
+                raise ValueError('Plain fields require format=text; do not insert raw LaTeX.')
+            await locator.fill(answer, timeout=ACTION_MS)
+        observed = await locator.evaluate(READ_FIELD, timeout=ACTION_MS)
+        actual = observed.get('latex') if field['kind'] == 'mathquill' else observed.get('value')
+        matches = (normalize_latex(actual or '') == normalize_latex(answer) if format == 'latex'
+                   else (observed.get('label') == answer if field['kind']=='select' else actual == answer))
+        self.latest['entered'][field_id] = dict(answer=answer, format=format, readback_matches=matches)
+        return dict(field_id=field_id, requested=answer, observed=observed, readback_matches=matches,
+                    submitted=False, used_keyboard=used_keyboard, requires_visual_verification=used_keyboard or not matches, note='When keyboard fallback is used, inspect a screenshot and confirm fraction boundaries before submitting. Check math and formatting before submitting. Readback is not correctness verification.')
+
+    async def feedback(self, page):
+        data = await self.inspect(page, assign=False)
+        return dict(url=data['url'], question_text=data['question_text'], math=data['math'],
+                    entered=(self.latest or {}).get('entered', {}), feedback=data['feedback'], visible_text=data['visible_text'],
+                    note='Report success only if the current website feedback explicitly confirms it. Never retry the same wrong answer blindly.')
