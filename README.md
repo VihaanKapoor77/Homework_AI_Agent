@@ -1,4 +1,4 @@
-# Homework agent(for dealta math)
+# Homework agent(for deltamath)
 
 This agent can do you homework for you.
 
