@@ -13,7 +13,7 @@ winget install -e --id Python.Python.3.12
 and to setup the agent run
 
 ```powershell
-py -3.13 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
@@ -21,7 +21,7 @@ notepad .env
 python agent.py
 ```
 
-If you already have a virtual environment, activate it instead of making another. If `py -3.13` isn't available, use `py` or `python` for a supported Python version. On some locked-down PowerShell setups, run `.venv\Scripts\python.exe agent.py` directly.`
+If you already have a virtual environment, activate it instead of making another. If `py -3.12` isn't available, use `py` or `python` for a supported Python version. On some locked-down PowerShell setups, run `.venv\Scripts\python.exe agent.py` directly.`
 
 **Edit `.env`** to replace `YOUR_GEMINI_API_KEY_HERE` with your own key. Do not share the key. If Chrome cannot be found, uncomment and set `CHROME_PATH` to your installed Chrome executable. Keep `HEADLESS=false` if you need to sign in manually.
 
