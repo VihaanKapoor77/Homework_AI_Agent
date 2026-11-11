@@ -1,19 +1,16 @@
-# DeltaMath study agent — repaired edition
+# Homework agent(for dealta math)
 
-This version replaces overlapping agent loops with **one controller**:
-
-1. Reuse a dedicated Chrome profile and inspect the current question.
-2. Solve clear algebra with a safe local SymPy worker (no Gemini requests needed).
-3. Use Gemini 3.5 Flash-Lite screenshot interpretation for diagrams/ambiguous notation.
-4. Check all roots and map each answer to a visible input/MathQuill field or dropdown.
-5. Verify entry before any submission, and report success **only** after explicit website feedback.
-6. Preserve a one-shot 60-second timeout recovery, scheduled tasks, worked-example notes, and local method memory.
-
-It doesn't access hidden DeltaMath answer APIs and doesn't bypass authentication or CAPTCHAs. There is no guarantee it can solve every possible DeltaMath question. It is intended as a learning/verification assistant, and only verified, readable answers should be submitted.
+This agent can do you homework for you.
 
 ## Install on Windows
 
-Use Python 3.11–3.13 if possible. In PowerShell, inside the unzipped project folder:
+Use Python 3.12 if possible. but any 3.1x should work
+
+to install python run 
+```powershell
+winget install -e --id Python.Python.3.12
+```
+and to setup the agent run
 
 ```powershell
 py -3.13 -m venv .venv
@@ -24,7 +21,7 @@ notepad .env
 python agent.py
 ```
 
-If you already have a virtual environment, activate it instead of making another. If `py -3.13` isn't available, use `py` or `python` for a supported Python version. On some locked-down PowerShell setups, run `.venv\Scripts\python.exe agent.py` directly.
+If you already have a virtual environment, activate it instead of making another. If `py -3.13` isn't available, use `py` or `python` for a supported Python version. On some locked-down PowerShell setups, run `.venv\Scripts\python.exe agent.py` directly.`
 
 **Edit `.env`** to replace `YOUR_GEMINI_API_KEY_HERE` with your own key. Do not share the key. If Chrome cannot be found, uncomment and set `CHROME_PATH` to your installed Chrome executable. Keep `HEADLESS=false` if you need to sign in manually.
 
@@ -64,16 +61,9 @@ $env:TEST_CHROME_PATH='C:\Program Files\Google\Chrome\Application\chrome.exe'
 python -m unittest discover -v -p "test_*.py"
 ```
 
-The **legacy HTTPS-route browser fixtures** are intentionally skipped because this test environment blocks outbound DeltaMath requests; the corresponding local Chromium fixtures are enabled with `RUN_BROWSER_TESTS=1`. The obsolete LangGraph test is also skipped because the legacy looping graph was removed. Both conditions are transparent, not claimed as passing tests.
 
-### Test evidence from this environment
 
-- **241/241 generated local math cases correct** (linear, quadratic, exact fractions, domain restrictions, and no-real-root cases).
-- Local math solver median **0.759 ms**, 95th percentile **3.861 ms**. This excludes process startup, reading web pages, network calls and model inference.
-- **76 unit/integration tests run: 71 passed, 5 skipped** (12 local real-Chromium DOM/controller tests were included).
-- Local Gradio UI smoke test returned **HTTP 200**.
 
-Live DeltaMath success rate, browser speed on the real site, and Gemini screenshot accuracy **were not measured** because no authenticated browser or API key is available in this environment. The real site may change its DOM or controls over time.
 
 ## Project entry points
 
@@ -85,4 +75,4 @@ Live DeltaMath success rate, browser speed on the real site, and Gemini screensh
 - `adaptive_math.py`: reusable methods and observed feedback memory.
 - `app.py` and `agent_rate_limited.py`: alternative launchers, same `main()`.
 
-The supplied original ~1,100-line agent is retained in `legacy/agent_original_reference.py` for comparison, but should **not** be used to launch the repaired version.
+
