@@ -44,24 +44,6 @@ Close that separate Chrome window before launching the normal app. Never send pa
 - **Examples and lessons:** observed Show Examples steps may be stored locally; method memory helps solve analogous questions with new numbers. Wrong attempts aren't recorded as correct answers.
 - **Privacy:** login is done manually. Screenshots sent to Gemini may contain visible page content. Store your API key only in local `.env` and avoid sharing screenshots containing private information.
 
-## Test it
-
-Run code-level tests with no key:
-
-```powershell
-python -m unittest discover -v -p "test_*.py"
-python benchmark.py
-```
-
-For local Chromium tests (no network or DeltaMath login required), set `TEST_CHROME_PATH` if Playwright can't find a browser. In PowerShell:
-
-```powershell
-$env:RUN_BROWSER_TESTS='1'
-$env:TEST_CHROME_PATH='C:\Program Files\Google\Chrome\Application\chrome.exe'
-python -m unittest discover -v -p "test_*.py"
-```
-
-
 
 
 
