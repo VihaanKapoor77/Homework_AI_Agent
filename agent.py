@@ -293,7 +293,9 @@ async def chat(message,history,request: gr.Request,subject='Auto'):
                             example_notes,MODEL,emit,PROFILE_DIR.parent/'answer_attempts.sqlite3',fast_mode=False,lookup=math_memory)
             async def invoke(resuming):
                 prompt=message
-                if resuming:prompt+=' Recovery after timeout: inspect current feedback; never resubmit a pending attempt.'
+                if resuming:
+                    prompt=re.sub(r'https://[^\s<>\"\']+', '', prompt)
+                    prompt+=' Recovery after timeout: inspect current feedback; never resubmit a pending attempt.'
                 try:return await asyncio.wait_for(controller.run(prompt),timeout=REQUEST_SECONDS)
                 except (PlaywrightTimeoutError,TimeoutError) as exc:raise BrowserTimedOut(str(exc)) from exc
             async def restart():
@@ -322,7 +324,8 @@ async def chat(message,history,request: gr.Request,subject='Auto'):
                     history[-1]['content']=('**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\n' if steps else '')+f'Working — {time.monotonic()-started:.0f}s elapsed. Waiting for the current operation to finish.'
                     yield [dict(x) for x in history]
         result=await task
-        history[-1]['content']=('**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\n' if steps else '')+str(result)+f'\n\nFinished in {time.monotonic()-started:.1f}s.'
+        elapsed_label='Paused after' if 'whole-assignment completion is NOT confirmed' in str(result) else 'Finished in'
+        history[-1]['content']=('**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\n' if steps else '')+str(result)+f'\n\n{elapsed_label} {time.monotonic()-started:.1f}s.'
     except Exception as exc:
         history[-1]['content']=error('AGENT_ERROR',f'{type(exc).__name__}: {exc}')
     finally:

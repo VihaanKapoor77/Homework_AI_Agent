@@ -215,6 +215,26 @@ class OfflineControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.ctrl.advance_to_next())
         self.assertTrue(self.page.url.endswith('/next'))
 
+    async def test_wraps_to_earlier_unfinished_skill(self):
+        body='''<aside>
+        <a href="/app/student/1/2/earlier">2 out of 5 complete. Earlier skill</a>
+        <a href="/app/student/1/2/current">Skill is complete. Current skill</a>
+        </aside><main><p>Question</p><input></main>'''
+        await self.page.route('http://delta.test/**',lambda route:route.fulfill(body=body,content_type='text/html'))
+        await self.page.goto('http://delta.test/app/student/1/2/current')
+        self.assertFalse(await self.ctrl.assignment_complete())
+        self.assertTrue(await self.ctrl.advance_to_next())
+        self.assertTrue(self.page.url.endswith('/earlier'))
+
+    async def test_assignment_completion_requires_all_skills_complete(self):
+        body='''<aside>
+        <a href="/app/student/1/2/first">Skill is complete. First</a>
+        <a href="/app/student/1/2/current">Skill is complete. Current</a>
+        </aside><main><p>Done</p></main>'''
+        await self.page.route('http://delta.test/**',lambda route:route.fulfill(body=body,content_type='text/html'))
+        await self.page.goto('http://delta.test/app/student/1/2/current')
+        self.assertTrue(await self.ctrl.assignment_complete())
+
     async def test_does_not_skip_an_incomplete_current_skill(self):
         body='''<aside>
         <a href="/app/student/1/2/current">0 out of 5 complete. Current skill</a>

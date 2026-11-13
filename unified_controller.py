@@ -492,8 +492,19 @@ class UnifiedController:
                 return 'Sign in manually in the dedicated Chrome window. The same browser profile is reused.'
             observed,snapshot,pixels=await self.observe(page)
             visible_text=snapshot.get('visible_text','')
+            if re.search(r'/sign-in(?:\?|$)',page.url) or await page.locator('input[type=password]').count():
+                return 'Sign in manually in the dedicated Chrome window, then send the task again.'
             next_buttons=[b for b in snapshot.get('buttons',[]) if not b.get('disabled') and
                 re.fullmatch(r'(?:next(?: question| problem| section)?|continue|try another)',b.get('text','').strip(),re.I)]
+            if (len(next_buttons)==1 and re.search(r'\byour answer\b',visible_text,re.I)
+                    and re.search(r'\bcorrect\b',visible_text,re.I)
+                    and not re.search(r'\bincorrect\b',visible_text,re.I)):
+                return 'Previously completed question: website shows correct.'
+            current_path=urlsplit(page.url).path.rstrip('/')
+            if any(urlsplit(s['href']).path.rstrip('/')==current_path and
+                   re.search(r'\bskill is complete\b',s.get('text',''),re.I)
+                   for s in snapshot.get('skills',[])):
+                return 'Previously completed question: current skill is complete.'
             if (len(next_buttons)==1 and
                     re.search(r'\byour answer\b',visible_text,re.I) and
                     re.search(r'\bsolution\b',visible_text,re.I) and
@@ -691,8 +702,11 @@ class UnifiedController:
                                 if urlsplit(skill['href']).path.rstrip('/')==current_path),None)
             if current_index is None or not re.search(r'\bskill is complete\b',skills[current_index]['text'],re.I):
                 return False
-            next_skill=next((skill for skill in skills[current_index+1:]
-                             if re.search(r'\b\d+\s+out of\s+\d+\s+complete\b',skill['text'],re.I)),None)
+            # Unfinished work can be before the current skill in the sidebar.
+            remaining=skills[current_index+1:]+skills[:current_index]
+            next_skill=next((skill for skill in remaining
+                             if re.search(r'\b\d+\s+out of\s+\d+\s+complete\b',skill['text'],re.I)
+                             and not re.search(r'\bskill is complete\b',skill['text'],re.I)),None)
             if next_skill is None:return False
             target=page.locator(next_skill['selector'])
             if await target.count()!=1 or not await target.is_visible():return False
@@ -705,6 +719,22 @@ class UnifiedController:
                     return True
             return False
 
+    async def assignment_complete(self):
+        """Only explicit site evidence can establish whole-assignment completion."""
+        if self.browser is None or self.delta is None:return False
+        async with self.browser.lock:
+            snapshot=await self.delta.inspect(await self.browser.page())
+        skills=snapshot.get('skills',[])
+        if skills:
+            return all(re.search(r'\bskill is complete\b',s.get('text',''),re.I) for s in skills)
+        return bool(re.search(r'\b(?:assignment (?:is )?complete|all skills (?:are )?complete)\b',
+                              snapshot.get('visible_text',''),re.I))
+
+    async def end_of_assignment(self,summary):
+        if await self.assignment_complete():
+            return summary+' Whole assignment complete: confirmed by the website.'
+        return summary+' Paused: whole-assignment completion is NOT confirmed. No unique next question or unfinished skill could be opened; check the assignment overview.'
+
     async def run(self,request:str):
         explicit=re.search(r'\b(?:solve|complete|do|answer|finish)\s+(?:the\s+)?(?:next\s+)?(\d+)\s+(?:questions|problems)\b',request,re.I)
         full_assignment=(
@@ -712,29 +742,42 @@ class UnifiedController:
                 r'\b(?:all|every|entire|whole|full)\b.*\b(?:questions?|problems?|assignment|homework|deltamath|work)\b',
                 request,re.I)
             or re.search(
-                r'\b(?:finish|complete|do(?:ing)?|solve|answer)\b.*\b(?:everything|all of (?:it|this))\b',
+                r'\b(?:finish|complete|do(?:ing)?|solve|answer)\b.*\b(?:everything|all of (?:it|this)|(?:whole|entire|full)\s+(?:thing|task))\b',
                 request,re.I)
+            or re.search(r'\b(?:finish|complete|do)\b.*\b(?:assignment|homework)\b',request,re.I)
         )
         goal=max(1,int(explicit.group(1))) if explicit else (None if full_assignment else 1)
         completed=0
         attempted=0
         incorrect=0
         next_question_ready=False
+        initial_request=True
+        if goal is None:self.emit('Whole-assignment mode: continuing across questions and unfinished skills until website completion is confirmed.')
         while goal is None or attempted < goal:
             if attempted and not next_question_ready:
                 advanced=await self.advance_to_next()
                 if not advanced:
                     result=f'Website acceptance observed: {completed} question(s) completed (observed: {completed}).'
                     if incorrect:result+=f' {incorrect} incorrect question(s) recorded.'
-                    return result+' No next question or unfinished assignment skill was available.'
+                    return await self.end_of_assignment(result) if goal is None else result+' Paused before the requested count: no next question was available.'
             next_question_ready=False
             # A supplied link selects the initial skill only. Later iterations
             # must preserve navigation to the next question/unfinished skill.
-            question_request=request if not attempted else re.sub(r'https://[^\s<>\"\']+', '', request)
+            question_request=request if initial_request else re.sub(r'https://[^\s<>\"\']+', '', request)
             result=await self._run_single(question_request)
+            initial_request=False
             attempted+=1
+            if (result.startswith('Previously completed question:') or
+                    (result.startswith('Previous attempt already recorded') and '(accepted)' in result)) and (goal is None or goal>1):
+                attempted-=1
+                if await self.advance_to_next():
+                    next_question_ready=True
+                    continue
+                summary=f'Website acceptance observed: {completed} question(s) completed in this run.'
+                return await self.end_of_assignment(summary) if goal is None else summary+' No next question was available.'
             if 'Website acceptance observed:' in result:
                 completed+=1
+                self.emit(f'{completed} question(s) accepted; '+('continuing until the whole assignment is complete.' if goal is None else f'target: {goal}.'))
                 continue
             if result.startswith('Website reported incorrect.') and (goal is None or goal>1):
                 incorrect+=1
@@ -742,14 +785,15 @@ class UnifiedController:
                     break
                 if not await self.advance_to_next():
                     summary=f'Website acceptance observed: {completed} question(s) completed (observed: {completed}).'
-                    return summary+f' {incorrect} incorrect question(s) recorded; no next question was available.'
+                    summary+=f' {incorrect} incorrect question(s) recorded.'
+                    return await self.end_of_assignment(summary) if goal is None else summary+' No next question was available.'
                 next_question_ready=True
                 continue
             if completed:
                 summary=f'Website acceptance observed: {completed} question(s) completed (observed: {completed}).'
                 if incorrect:summary+=f' {incorrect} incorrect question(s) recorded.'
-                return summary+' Stopped: '+result
-            return result
+                return summary+(' Paused: whole-assignment completion is NOT confirmed. ' if goal is None else ' Stopped: ')+result
+            return ('Paused: whole-assignment completion is NOT confirmed. '+result) if goal is None else result
         if incorrect:
             return (f'Website acceptance observed: {completed} question(s) completed (observed: {completed}). '
                     f'{incorrect} incorrect question(s) recorded in {attempted} attempts.')

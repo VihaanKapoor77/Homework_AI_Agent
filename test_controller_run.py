@@ -7,6 +7,40 @@ from unified_controller import UnifiedController
 
 
 class ControllerRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resumes_completed_question_without_reopening_initial_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller=self.make_controller(directory)
+            controller._run_single=AsyncMock(side_effect=[
+                'Previously completed question: current skill is complete.',
+                'Website acceptance observed: 1 question completed.'])
+            controller.advance_to_next=AsyncMock(side_effect=[True,False])
+            controller.assignment_complete=AsyncMock(return_value=True)
+            result=await controller.run('Finish the whole thing https://www.deltamath.com/app/student/1/2/start')
+            self.assertNotIn('https://',controller._run_single.await_args_list[1].args[0])
+            self.assertIn('1 question(s) completed',result)
+            self.assertIn('Whole assignment complete:',result)
+
+    async def test_whole_thing_and_finish_assignment_continue(self):
+        for prompt in ('Finish the whole thing','Complete the entire task','Finish this assignment','Do my homework'):
+            with self.subTest(prompt=prompt),tempfile.TemporaryDirectory() as directory:
+                controller=self.make_controller(directory)
+                controller._run_single=AsyncMock(return_value='Website acceptance observed: 1 question completed.')
+                controller.advance_to_next=AsyncMock(side_effect=[True,False])
+                controller.assignment_complete=AsyncMock(return_value=True)
+                result=await controller.run(prompt)
+                self.assertEqual(controller._run_single.await_count,2)
+                self.assertIn('Whole assignment complete: confirmed',result)
+
+    async def test_missing_next_is_not_assignment_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller=self.make_controller(directory)
+            controller._run_single=AsyncMock(return_value='Website acceptance observed: 1 question completed.')
+            controller.advance_to_next=AsyncMock(return_value=False)
+            controller.assignment_complete=AsyncMock(return_value=False)
+            result=await controller.run('Finish the whole thing')
+            self.assertIn('completion is NOT confirmed',result)
+            self.assertNotIn('Whole assignment complete:',result)
+
     def make_controller(self, directory):
         return UnifiedController(
             None, None, None, None, None, None, 'unused', lambda _: None,
