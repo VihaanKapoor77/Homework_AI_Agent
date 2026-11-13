@@ -25,6 +25,26 @@ def normalize_latex(value: str) -> str:
     return re.sub(r'\s+', '', value.replace(r'\left', '').replace(r'\right', ''))
 
 
+def _canonical_option_label(value: str) -> str:
+    value=value.casefold().replace('\xa0',' ').replace('−','-').replace('°',' degrees ').replace('∘',' degrees ')
+    value=re.sub(r'\bequals\b','=',value)
+    value=re.sub(r'\bminus\b','-',value)
+    value=value.replace(',',' ')
+    value=re.sub(r'\s*([=-])\s*',r'\1',value)
+    return re.sub(r'\s+',' ',value).strip()
+
+
+def visible_option_label(value: str) -> str:
+    lines=[line.strip() for line in value.splitlines() if line.strip()]
+    if len(lines)>1 and _canonical_option_label(lines[0])==_canonical_option_label(' '.join(lines[1:])):
+        return lines[0]
+    return re.sub(r'\s+',' ',value.replace('\xa0',' ')).strip()
+
+
+def normalize_option_label(value: str) -> str:
+    return _canonical_option_label(visible_option_label(value))
+
+
 READ_PAGE = r'''({scope, prefix, assign}) => {
     const main = document.querySelectorAll('main, [role="main"]');
     const roots = scope === 'auto' ? (main.length === 1 ? main : [document.body]) : document.querySelectorAll(scope);
@@ -34,9 +54,12 @@ READ_PAGE = r'''({scope, prefix, assign}) => {
     const MQ = window.MathQuill && typeof window.MathQuill.getInterface === 'function'
         ? window.MathQuill.getInterface(2) : null;
     const apiFor = el => { try { return typeof MQ === 'function' ? MQ(el) : null; } catch { return null; } };
-    const label = el => el.getAttribute('aria-label') ||
-        (el.labels ? [...el.labels].map(x => x.textContent).join(' ') : '') ||
-        el.getAttribute('placeholder') || '';
+    const label = el => {
+        const labelText = el.labels ? [...el.labels].map(x => x.innerText).join(' ') : '';
+        return (el.type === 'radio' && labelText.trim()) ||
+            el.getAttribute('aria-label') || labelText ||
+            el.getAttribute('placeholder') || '';
+    };
     const math = [...root.querySelectorAll('.mq-math-mode, .katex, math, [data-latex]')]
         .filter(el => visible(el) && !el.closest('#answer-block, .mq-editable-field, [contenteditable="true"]'))
         .slice(0, 60).map(el => {
@@ -50,13 +73,13 @@ READ_PAGE = r'''({scope, prefix, assign}) => {
         });
     const fields = [...root.querySelectorAll('.mq-editable-field, input, textarea, select, [contenteditable="true"]')]
         .filter(el => visible(el) && !el.disabled && !el.readOnly &&
-            !['password','hidden','checkbox','radio','submit','button'].includes(el.type) &&
+            !['password','hidden','checkbox','submit','button'].includes(el.type) &&
             (el.classList.contains('mq-editable-field') || !el.closest('.mq-editable-field')))
         .slice(0, 30).map((el, i) => {
             const id = prefix + '-field-' + i;
             if (assign) el.setAttribute('data-dm-agent', id);
             const api = apiFor(el);
-            return {id, selector: '[data-dm-agent="' + id + '"]', label: label(el), kind: el.classList.contains('mq-editable-field') ? 'mathquill' : (el.tagName === 'SELECT' ? 'select' : 'text'), options: el.tagName === 'SELECT' ? [...el.options].map(x=>({label:x.label,value:x.value})).slice(0,30) : [],
+            return {id, selector: '[data-dm-agent="' + id + '"]', label: label(el), kind: el.type === 'radio' ? 'radio_option' : (el.classList.contains('mq-editable-field') ? 'mathquill' : (el.tagName === 'SELECT' ? 'select' : 'text')), options: el.tagName === 'SELECT' ? [...el.options].map(x=>({label:x.label,value:x.value})).slice(0,30) : [],
                 has_mathquill_api: !!api, value: api && typeof api.latex === 'function' ? api.latex() :
                     ('value' in el ? el.value : el.innerText)};
         });
@@ -76,13 +99,28 @@ READ_PAGE = r'''({scope, prefix, assign}) => {
         if (parent && !parent.closest(ignored) && visible(parent)) pieces.push(node.textContent);
     }
     const question_text = pieces.join(' ').replace(/\s+/g, ' ').trim();
-    const images = [...root.querySelectorAll('img, canvas, svg[role="img"]')].filter(visible).slice(0, 15)
+    const images = [...root.querySelectorAll('img, canvas, svg[role="img"], svg.delta-graph')].filter(visible).slice(0, 15)
         .map(el => ({tag: el.tagName, alt: el.getAttribute('alt') || el.getAttribute('aria-label') || '',
-            src: el.tagName === 'IMG' ? el.getAttribute('src') : null}));
+            src: el.tagName === 'IMG' ? el.getAttribute('src') : null,
+            geometry: [...el.querySelectorAll('path.func[fill="lightpink"],path.func[fill="lightblue"]')]
+                .map(p=>({path:p.getAttribute('d'),fill:p.getAttribute('fill')}))}));
     const feedback = [...document.querySelectorAll('[role="alert"], [role="status"], [aria-live]:not([aria-live="off"])')]
         .filter(visible).map(el => (el.innerText || '').trim()).filter(Boolean).slice(0, 15);
+    const pathParts = location.pathname.split('/').filter(Boolean);
+    const skillPrefix = pathParts.length === 5 ? '/' + pathParts.slice(0, 4).join('/') + '/' : '';
+    const skills = skillPrefix ? [...document.querySelectorAll('a[href]')].filter(visible).map((el, i) => {
+        const href = new URL(el.href, location.href);
+        const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        const id = prefix + '-skill-' + i;
+        if (assign) el.setAttribute('data-dm-agent-skill', id);
+        return {id, selector: '[data-dm-agent-skill="' + id + '"]', href: href.href, text};
+    }).filter(skill => {
+        const skillPath = new URL(skill.href).pathname.split('/').filter(Boolean);
+        return skill.href.startsWith(location.origin) && skill.href.includes(skillPrefix) &&
+            skillPath.length === 5 && /(?:skill is complete|\d+\s+out of\s+\d+\s+complete)/i.test(skill.text);
+    }) : [];
     return {url: location.href, question_text: question_text.slice(0, 14000), math, fields, buttons,
-        images, feedback, visible_text: (root.innerText || '').slice(0, 14000),
+        images, feedback, skills, visible_text: (root.innerText || '').slice(0, 14000),
         truncated: question_text.length > 14000};
 }'''
 
@@ -92,6 +130,8 @@ READ_FIELD = r'''el => {
         const field = typeof MQ === 'function' ? MQ(el) : null;
         return {kind: 'mathquill', latex: field && typeof field.latex === 'function' ? field.latex() : null, text: el.innerText};
     }
+    if (el.type === 'radio') return {kind:'radio',value:el.value,checked:el.checked,
+        label:[...(el.labels || [])].map(x=>x.innerText).join(' ').trim()};
     if (el.tagName === 'SELECT') return {kind:'select',value:el.value,label:el.selectedOptions[0]?.label || ''};
     return {kind: 'text', value: 'value' in el ? el.value : el.innerText};
 }'''
@@ -199,14 +239,25 @@ class DeltaMathTools:
             if len(matches)!=1:
                 raise ValueError('Dropdown answer did not match one unique visible option.')
             await locator.select_option(label=answer,timeout=ACTION_MS)
+        elif field['kind'] == 'radio_option':
+            if format != 'text':
+                raise ValueError('Radio choices require a plain visible option label.')
+            await locator.check(timeout=ACTION_MS)
         else:
             if format != 'text':
                 raise ValueError('Plain fields require format=text; do not insert raw LaTeX.')
             await locator.fill(answer, timeout=ACTION_MS)
         observed = await locator.evaluate(READ_FIELD, timeout=ACTION_MS)
-        actual = observed.get('latex') if field['kind'] == 'mathquill' else observed.get('value')
-        matches = (normalize_latex(actual or '') == normalize_latex(answer) if format == 'latex'
-                   else (observed.get('label') == answer if field['kind']=='select' else actual == answer))
+        actual = observed.get('latex') if field['kind'] == 'mathquill' else (
+            observed.get('label') if field['kind'] == 'radio_option' else observed.get('value'))
+        if format == 'latex':
+            matches=normalize_latex(actual or '')==normalize_latex(answer)
+        elif field['kind']=='radio_option':
+            matches=bool(observed.get('checked') and normalize_option_label(actual or '')==normalize_option_label(answer))
+        elif field['kind']=='select':
+            matches=observed.get('label')==answer
+        else:
+            matches=actual==answer
         self.latest['entered'][field_id] = dict(answer=answer, format=format, readback_matches=matches)
         return dict(field_id=field_id, requested=answer, observed=observed, readback_matches=matches,
                     submitted=False, used_keyboard=used_keyboard, requires_visual_verification=used_keyboard or not matches, note='When keyboard fallback is used, inspect a screenshot and confirm fraction boundaries before submitting. Check math and formatting before submitting. Readback is not correctness verification.')

@@ -62,5 +62,9 @@ async def generate_json(prompt:str,image:bytes|None=None,model:str|None=None,tim
             outputs=candidates[0].get('content',{}).get('parts',[])
             texts=[p.get('text','') for p in outputs if 'text' in p]
             if not texts:raise ModelError('Gemini did not return text. It may have declined this request.')
-            return _json(''.join(texts))
+            try:return _json(''.join(texts))
+            except (json.JSONDecodeError,ModelError) as exc:
+                if attempt==2:raise ModelError('Model returned malformed JSON after 3 attempts; no action approved.') from exc
+                REPORT('Model returned malformed JSON; requesting a fresh response before any action.')
+                continue
     raise ModelError('Gemini request unsuccessful')

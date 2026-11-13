@@ -10,11 +10,14 @@ import re
 import sqlite3
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from pydantic import BaseModel,Field,model_validator
 from gemini_client import generate_json
 from math_solver import calculate
 from delta_workflow import enter_solution_set
-from deltamath_tools import is_deltamath
+from deltamath_tools import is_deltamath,normalize_option_label,visible_option_label
+from graph_entry import graph_plan, plot_points, guided_reflection, reflection_slopes, reflection_equation
+from piecewise_graph import plan_piecewise, enter_piecewise
 
 class Plan(BaseModel):
     action:str='report'
@@ -30,6 +33,7 @@ class Plan(BaseModel):
     answer_rays:list[str]=Field(default_factory=list)
     opposite_rays:list[list[str]]=Field(default_factory=list)
     uncertainty:str=''
+    graph_points:list[tuple[float,float]]=Field(default_factory=list)
 
     @model_validator(mode='before')
     @classmethod
@@ -43,6 +47,9 @@ class Plan(BaseModel):
         if not isinstance(data,dict):
             return data
         cleaned=data.copy()
+        for name in ('target_rays','answer_rays','opposite_rays'):
+            if cleaned.get(name) == '':
+                cleaned[name]=[]
         if isinstance(cleaned.get('uncertainty'),(bool,int,float)):
             cleaned['uncertainty']='Model reported uncertainty without an explanation.' if cleaned['uncertainty'] else ''
         defaults={
@@ -135,9 +142,15 @@ class UnifiedController:
         self.lookup=lookup
         self.last_url=None
 
+    @staticmethod
+    def submission_requested(request):
+        if re.search(r"\b(?:don't|do not|never|not)\s+(?:submit|send|grade)\b|\bwithout\s+submitting\b",request,re.I):
+            return False
+        return bool(re.search(r'\b(?:solve|answer|do|doing|complete|finish|submit)\b',request,re.I))
+
     async def observe(self,page):
         snapshot=await self.delta.inspect(page)
-        if not snapshot.get('fields'):
+        if not snapshot.get('fields') and 'Click and drag to make a line.' not in snapshot.get('visible_text',''):
             # The page shell can be stable before the question/answer UI mounts.
             for _ in range(3):
                 await asyncio.sleep(1)
@@ -154,6 +167,8 @@ class UnifiedController:
                  'visible_text':snapshot.get('visible_text','')},snapshot,pixels)
 
     async def ask(self,kind,context,pixels):
+        self.emit('Reading and solving the visible question with the model.' if kind=='plan'
+                  else 'Independently checking the entered answer before submission.')
         if kind=='plan':
             prompt=('Inspect this math assignment screenshot and the visible text JSON. Return JSON fields: '
                '{action:"answer|report|example",summary,equation,answers:[strings],method,submit:boolean, '
@@ -167,6 +182,7 @@ class UnifiedController:
                'Match answers to the visible fields in their listed order. For dropdowns use the exact '
                'visible option label. Never treat answer blanks or field prefixes like x= as equations. '
                'If any labels are unreadable or answer uncertain, action report with reason. '
+               'For dropdowns and radio choices, use the exact visible option label. '
                'Answer is a candidate until verified. Never invent coordinates or missing symbols.\n')
             raw=await generate_json(prompt+json.dumps(context,ensure_ascii=False),pixels,self.model)
             return Plan.model_validate(raw)
@@ -181,6 +197,144 @@ class UnifiedController:
             raw=await generate_json(prompt+json.dumps(context,ensure_ascii=False),pixels,self.model)
             return Check.model_validate(raw)
         return Plan(action='report',summary='Stopped after one question.')
+
+    @staticmethod
+    def coordinate_point_sets(snapshot,expected_count):
+        pair_pattern=re.compile(
+            r'left parenthesis,\s*((?:minus\s*,\s*)?-?\d+),\s*comma,\s*((?:minus\s*,\s*)?-?\d+),\s*right parenthesis',
+            re.I)
+        coordinate_sets=set()
+        for image in snapshot.get('images',[]):
+            pairs=pair_pattern.findall(image.get('alt',''))
+            if len(pairs)!=expected_count:
+                continue
+            points=[]
+            for x,y in pairs:
+                x=re.sub(r'\s+','',x.lower())
+                y=re.sub(r'\s+','',y.lower())
+                points.append((
+                    -int(x.split(',')[-1]) if x.startswith('minus,') else int(x),
+                    -int(y.split(',')[-1]) if y.startswith('minus,') else int(y),
+                ))
+            coordinate_sets.add(tuple(points))
+        return coordinate_sets
+
+    @staticmethod
+    def rotation_label(label,degrees,direction=None):
+        label=normalize_option_label(label)
+        if not (re.search(r'\brotation\b',label)
+                and re.search(rf'\b{degrees}\b',label)
+                and re.search(r'\borigin\b',label)):
+            return False
+        if direction=='counterclockwise':
+            return bool(re.search(r'\bcounter[\s-]*clockwise\b',label))
+        if direction=='clockwise':
+            return bool(re.search(r'(?<!counter-)(?<!counter )\bclockwise\b',label))
+        return True
+
+    @staticmethod
+    def reflection_label(label,axis):
+        label=normalize_option_label(label)
+        if not re.search(r'\b(?:reflection|reflect(?:ed)?)\b',label):
+            return False
+        if axis in ('x-axis','y-axis'):
+            axis_name=axis[0]
+            return bool(re.search(rf'\b{axis_name}(?:\s*-\s*|\s+)axis\b',label))
+        if axis=='y=x':
+            return bool(re.search(r'\by\s*=\s*x\b',label))
+        return bool(re.search(r'\by\s*=\s*-\s*x\b',label))
+
+    def transformation_rules(self):
+        return [
+            (lambda x,y:(-y,x),lambda label:self.rotation_label(label,90,'counterclockwise')),
+            (lambda x,y:(y,-x),lambda label:self.rotation_label(label,90,'clockwise')),
+            (lambda x,y:(-x,-y),lambda label:self.rotation_label(label,180)),
+            (lambda x,y:(x,-y),lambda label:self.reflection_label(label,'x-axis')),
+            (lambda x,y:(-x,y),lambda label:self.reflection_label(label,'y-axis')),
+            (lambda x,y:(y,x),lambda label:self.reflection_label(label,'y=x')),
+            (lambda x,y:(-y,-x),lambda label:self.reflection_label(label,'y=-x')),
+        ]
+
+    def coordinate_transformation_plan(self,snapshot,request):
+        fields=snapshot.get('fields',[])
+        if len(fields)<2 or any(field.get('kind')!='radio_option' for field in fields):
+            return None
+        if not re.search(r'\btransformation\b',snapshot.get('question_text',''),re.I):
+            return None
+        coordinate_sets=self.coordinate_point_sets(snapshot,6)
+        if len(coordinate_sets)!=1:
+            return None
+        points=next(iter(coordinate_sets))
+        offsets={(target[0]-source[0],target[1]-source[1])
+                 for source,target in zip(points[:3],points[3:])}
+        submit=self.submission_requested(request)
+
+        matched_options={}
+        recognized=False
+        if len(offsets)==1:
+            dx,dy=next(iter(offsets))
+            if dx or dy:
+                recognized=True
+                x_direction='right' if dx>0 else 'left'
+                y_direction='up' if dy>0 else 'down'
+                pattern=re.compile(
+                    rf'\btranslation\b.*?\b{abs(dx)}\s+units?\s+{x_direction}\b'
+                    rf'.*?\b{abs(dy)}\s+units?\s+{y_direction}\b',re.I)
+                for index,field in enumerate(fields):
+                    label=normalize_option_label(field.get('label',''))
+                    if pattern.search(label):
+                        matched_options[index]=field
+        for transform,matches_label in self.transformation_rules():
+            if not all(transform(*source)==target
+                       for source,target in zip(points[:3],points[3:])):
+                continue
+            recognized=True
+            for index,field in enumerate(fields):
+                label=normalize_option_label(field.get('label',''))
+                if matches_label(label):
+                    matched_options[index]=field
+        if not recognized:
+            return None
+        if len(matched_options)!=1:
+            return Plan(action='report',
+                summary='Computed coordinate transformation does not uniquely match a visible radio option; not submitting.')
+        answer=visible_option_label(next(iter(matched_options.values())).get('label',''))
+        return Plan(action='answer',summary='Verified rigid transformation from paired vertex coordinates',
+            answers=[answer],submit=submit,method='coordinate transformation')
+
+    def quadrilateral_symmetry_plan(self,snapshot,request):
+        fields=snapshot.get('fields',[])
+        question=snapshot.get('question_text','')
+        if (len(fields)<2 or any(field.get('kind')!='radio_option' for field in fields)
+                or not re.search(r'\btransformation\b',question,re.I)
+                or not re.search(r'\b(?:carry|map)\b.*\bonto itself\b',question,re.I)):
+            return None
+        coordinate_sets=self.coordinate_point_sets(snapshot,4)
+        if len(coordinate_sets)!=1:
+            return None
+        points=next(iter(coordinate_sets))
+        point_set=set(points)
+        if len(point_set)!=4:
+            return None
+        options=[]
+        for field in fields:
+            label=field.get('label','')
+            matching_transforms=[transform for transform,matches_label in self.transformation_rules()
+                                 if matches_label(label)]
+            if len(matching_transforms)!=1:
+                return None
+            transform=matching_transforms[0]
+            preserves=({transform(*point) for point in point_set}==point_set)
+            options.append((field,preserves))
+        asks_for_nonpreserving=bool(re.search(r'\b(?:not|never)\b',question,re.I))
+        desired_preservation=not asks_for_nonpreserving
+        answers=[field for field,preserves in options if preserves==desired_preservation]
+        if len(answers)!=1:
+            return None
+        return Plan(action='answer',
+            summary='Verified symmetry of all four plotted vertices',
+            answers=[visible_option_label(answers[0].get('label',''))],
+            submit=self.submission_requested(request),method='quadrilateral symmetry')
 
     def local_plan(self,snapshot):
         if not self.fast_mode or snapshot.get('images'):
@@ -233,6 +387,8 @@ class UnifiedController:
         if not answers:raise ValueError('No verified answers for entry')
         if len(answers)>1:
             kinds=[f.get('kind') for f in snapshot.get('fields',[])]
+            if 'radio_option' in kinds:
+                raise ValueError('A radio-choice question requires exactly one selected answer.')
             if kinds and all(kind!='mathquill' for kind in kinds):
                 answers=[self._plain_answer(answer) for answer in answers]
             result=await enter_solution_set(self.delta,page,snapshot['snapshot_token'],answers)
@@ -240,10 +396,24 @@ class UnifiedController:
                 raise ValueError('One or more answers did not read back correctly; no submission')
             return result
         fields=snapshot.get('fields') or []
-        if len(fields)!=1:
-            raise ValueError('Ambiguous answer-field mapping; need manual inspection')
-        field=fields[0]
-        actual_answer=answers[0] if field['kind']=='mathquill' else self._plain_answer(answers[0])
+        radio_options=[f for f in fields if f.get('kind')=='radio_option']
+        if radio_options:
+            if len(radio_options)!=len(fields):
+                raise ValueError('Radio-choice question has additional answer fields; need manual inspection.')
+            matches=[f for f in radio_options
+                     if normalize_option_label(f.get('label',''))==normalize_option_label(answers[0])]
+            if len(matches)!=1:
+                options=[f.get('label','') for f in radio_options]
+                raise ValueError(f'Answer did not match one unique visible radio option '
+                                 f'(answer={answers[0]!r}, options={options!r}).')
+            field=matches[0]
+        else:
+            if len(fields)!=1:
+                raise ValueError('Ambiguous answer-field mapping; need manual inspection')
+            field=fields[0]
+        actual_answer=(answers[0] if field['kind']=='mathquill' else
+                       (visible_option_label(field['label']) if field['kind']=='radio_option'
+                        else self._plain_answer(answers[0])))
         result=await self.delta.enter(page,snapshot['snapshot_token'],field['id'],actual_answer,
                       'latex' if field['kind']=='mathquill' else 'text')
         if not self.readback_or_visual(result):
@@ -309,23 +479,96 @@ class UnifiedController:
             page=await self.browser.page()
             self.last_url=page.url
             # Open a supplied DeltaMath URL only; preserve the existing signed-in profile.
-            if not is_deltamath(page.url):
-                urls=re.findall(r'https://[^\s<>\"\']+',request)
-                targets=[u.rstrip('.,);') for u in urls if u.startswith(('https://deltamath.com/','https://www.deltamath.com/'))]
-                if targets:
-                    await page.goto(targets[0],wait_until='domcontentloaded',timeout=120000)
-                    self.last_url=page.url
-                else:
-                    return 'Open your DeltaMath assignment in the dedicated Chrome window, or paste its HTTPS link here.'
+            urls=re.findall(r'https://[^\s<>\"\']+',request)
+            targets=[u.rstrip('.,);') for u in urls if u.startswith(('https://deltamath.com/','https://www.deltamath.com/'))]
+            if targets and page.url.rstrip('/')!=targets[0].rstrip('/'):
+                self.emit('Opening the requested DeltaMath assignment.')
+                await page.goto(targets[0],wait_until='domcontentloaded',timeout=120000)
+                self.last_url=page.url
+            elif not is_deltamath(page.url):
+                return 'Open your DeltaMath assignment in the dedicated Chrome window, or paste its HTTPS link here.'
             password_count=page.locator('input[type=password]').count()
             if inspect.isawaitable(password_count) and await password_count:
                 return 'Sign in manually in the dedicated Chrome window. The same browser profile is reused.'
             observed,snapshot,pixels=await self.observe(page)
+            visible_text=snapshot.get('visible_text','')
+            next_buttons=[b for b in snapshot.get('buttons',[]) if not b.get('disabled') and
+                re.fullmatch(r'(?:next(?: question| problem| section)?|continue|try another)',b.get('text','').strip(),re.I)]
+            if (len(next_buttons)==1 and
+                    re.search(r'\byour answer\b',visible_text,re.I) and
+                    re.search(r'\bsolution\b',visible_text,re.I) and
+                    re.search(r'\bincorrect\b',visible_text,re.I)):
+                self.journal.set(snapshot['signature'],'incorrect')
+                return 'Website reported incorrect. Previous attempt recorded; do not retry unchanged.'
+            guided_steps=('Click and drag to draw lines connecting all corresponding points','Plot the midpoints of all the dotted lines.','Draw a line that goes through all of the yellow midpoints.','Now write the slope of the line of reflection and any dotted line.')
+            if any(step in snapshot.get('visible_text','') for step in guided_steps) and self.submission_requested(request):
+                signature=snapshot['signature']
+                if self.journal.get(signature):return 'Previous guided attempt recorded; review feedback before retrying.'
+                for _ in range(5):
+                    before=snapshot.get('visible_text','')
+                    if guided_steps[-1] in before:
+                        if await page.locator('#reflectEquation.mq-editable-field:visible').count()==1:
+                            answers=[await reflection_equation(page)]
+                        elif len(snapshot.get('fields',[]))==2:
+                            answers=await reflection_slopes(page)
+                        else:break
+                        await self.enter(page,snapshot,answers)
+                        check=await self.ask('check',{'expected_answers':answers,'problem':before},await page.screenshot(full_page=True))
+                        if not (check.entry_matches and check.math_correct and check.all_solutions_present):return 'Not submitted: slope verification failed. '+check.reason
+                        await page.get_by_role('button',name='Try Values',exact=True).click()
+                        await asyncio.sleep(.5)
+                    else:self.emit(await guided_reflection(page) or 'Guided steps finished.')
+                    snapshot=await self.delta.inspect(page)
+                    if snapshot.get('visible_text','')==before:return 'Stopped: guided step did not advance.'
+                    if not any(step in snapshot.get('visible_text','') for step in guided_steps) or any(b.get('text','').strip()=='Submit Answer' for b in snapshot.get('buttons',[])):break
+                if not self.submission_requested(request):return 'Guided construction entered; not submitted.'
+                self.journal.set(signature,'submission_pending')
+                outcome=await self.submit(page,snapshot)
+                if outcome=='not_submitted':
+                    self.journal.clear(signature)
+                    return 'Guided construction completed; no final Submit control yet.'
+                if outcome=='accepted':
+                    self.journal.set(signature,'accepted')
+                    return 'Website acceptance observed: 1 question completed (observed: 1).'
+                return 'Guided submission feedback: '+outcome+'. Stopped without retrying.'
             signature=snapshot['signature']
             prior=self.journal.get(signature)
             if prior in ('submission_pending','accepted'):
                 return 'Previous attempt already recorded for this question ('+prior+'). Check website feedback before retrying.'
-            local=self.local_plan(snapshot)
+            if ('Graph the following function' in visible_text and
+                    'Click and drag to make a line.' in visible_text and
+                    any('\\begin{cases}' in (m.get('latex') or '') for m in snapshot.get('math',[]))):
+                try:
+                    segments=await plan_piecewise(page)
+                    self.emit(f'Drawing {len(segments)} exact piecewise segments and checking endpoints locally.')
+                    await enter_piecewise(page,segments)
+                    if await plan_piecewise(page)!=segments:
+                        return 'Not submitted: the piecewise question changed during entry.'
+                except ValueError as exc:
+                    return 'Not submitted: '+str(exc)
+                if not self.submission_requested(request):
+                    return 'Answer entered and checked but not submitted, as requested.'
+                fresh=await self.delta.inspect(page)
+                if fresh['signature']!=signature:
+                    return 'Not submitted: the question changed during graph entry.'
+                self.journal.set(signature,'submission_pending')
+                outcome=await self.submit(page,fresh)
+                if outcome=='not_submitted':
+                    self.journal.clear(signature)
+                    return 'Graph checked but no unique Submit control was available.'
+                if outcome=='accepted':
+                    self.journal.set(signature,'accepted')
+                    return 'Website acceptance observed: 1 question completed (observed: 1).'
+                if outcome=='incorrect':
+                    return 'Website reported incorrect. Previous attempt recorded; do not retry unchanged.'
+                return 'Website feedback unknown. Submission may have happened; do not repeat automatically.'
+            local=(self.coordinate_transformation_plan(snapshot,request)
+                   or self.quadrilateral_symmetry_plan(snapshot,request)
+                   or self.local_plan(snapshot))
+            points=await graph_plan(page,snapshot.get('question_text','')) if not snapshot.get('fields') and re.search(r'(?:Translate|Reflect) the figure',snapshot.get('question_text',''),re.I) else None
+            if points:
+                local=Plan(action='answer',summary='Transform every rendered source vertex',
+                    answers=[str(p) for p in points],graph_points=points,submit=self.submission_requested(request))
             references=[]
             if not local:
                 try:
@@ -371,19 +614,31 @@ class UnifiedController:
                 answers=await self.answers_for(plan)
             if not answers:
                 return 'Not submitted: no verified solutions were returned; inspect assignment formatting.'
+            plan.submit=self.submission_requested(request)
             self.emit('Entering '+str(len(answers))+' answer(s)…')
-            try:await self.enter(page,snapshot,answers)
+            try:
+                if plan.graph_points:await plot_points(page,plan.graph_points)
+                else:await self.enter(page,snapshot,answers)
             except TimeoutError:
                 raise
             except Exception as exc:return 'Not submitted: '+str(exc)
             fresh=await self.delta.inspect(page)
             # Use a single model check for images/custom math editors; skip extra API call
             # only on the deterministic text-equation fast path with complete readback.
-            if local and all(f.get('kind')=='text' for f in snapshot.get('fields',[])):
+            if local and plan.graph_points:
+                check=Check(entry_matches=True,math_correct=True,all_solutions_present=True,
+                    reason='Exact vertex transformation and complete plotted-coordinate readback')
+            elif local and plan.method=='coordinate transformation':
+                check=Check(entry_matches=True,math_correct=True,all_solutions_present=True,
+                    reason='Exact coordinate mapping matches the selected transformation option')
+            elif local and plan.method=='quadrilateral symmetry':
+                check=Check(entry_matches=True,math_correct=True,all_solutions_present=True,
+                    reason='Exact transformation check on all four plotted vertices')
+            elif local and snapshot.get('fields') and all(f.get('kind')=='text' for f in snapshot.get('fields',[])):
                 check=Check(entry_matches=True,math_correct=True,all_solutions_present=True,
                     reason='Verified roots and exact text-field readback')
             else:
-                shot=page.screenshot(timeout=30000)
+                shot=page.screenshot(timeout=30000,full_page=True) if plan.graph_points else page.screenshot(timeout=30000)
                 screenshot=await shot if inspect.isawaitable(shot) else pixels
                 check=await self.ask('check',{'expected_answers':answers,'original_equation':plan.equation,'problem':observed},screenshot)
                 if not isinstance(check,Check):check=Check.model_validate(check)
@@ -410,42 +665,94 @@ class UnifiedController:
             return 'Website feedback unknown. Submission may have happened; do not repeat automatically.'
 
     async def advance_to_next(self):
-        """Advance only after explicit website acceptance, using an observed control."""
+        """Advance using a unique observed next control, or to a skill after completion."""
         async with self.browser.lock:
             page=await self.browser.page()
             snap=await self.delta.inspect(page)
             matches=[b for b in snap.get('buttons',[]) if not b.get('disabled') and
-                 re.fullmatch(r'(?:next(?: question| problem)?|continue|try another)',b.get('text','').strip(),re.I)]
-            if len(matches)!=1:
+                 re.fullmatch(r'(?:next(?: question| problem| section)?|continue|try another)',b.get('text','').strip(),re.I)]
+            if len(matches)>1:
                 return False
-            target=page.locator(matches[0]['selector'])
-            if await target.count()!=1:return False
-            old=snap['signature']
+            if len(matches)==1:
+                target=page.locator(matches[0]['selector'])
+                if await target.count()!=1:return False
+                old=snap['signature']
+                await target.click(timeout=15000)
+                for _ in range(12):
+                    await asyncio.sleep(.2)
+                    fresh=await self.delta.inspect(page)
+                    if fresh['signature']!=old and fresh.get('question_text'):
+                        self.last_url=page.url
+                        return True
+                return False
+            skills=snap.get('skills',[])
+            current_path=urlsplit(page.url).path.rstrip('/')
+            current_index=next((i for i,skill in enumerate(skills)
+                                if urlsplit(skill['href']).path.rstrip('/')==current_path),None)
+            if current_index is None or not re.search(r'\bskill is complete\b',skills[current_index]['text'],re.I):
+                return False
+            next_skill=next((skill for skill in skills[current_index+1:]
+                             if re.search(r'\b\d+\s+out of\s+\d+\s+complete\b',skill['text'],re.I)),None)
+            if next_skill is None:return False
+            target=page.locator(next_skill['selector'])
+            if await target.count()!=1 or not await target.is_visible():return False
             await target.click(timeout=15000)
             for i in range(12):
                 await asyncio.sleep(.2)
                 fresh=await self.delta.inspect(page)
-                if fresh['signature']!=old and fresh.get('question_text'):
+                if urlsplit(page.url).path.rstrip('/')!=current_path and fresh.get('question_text'):
                     self.last_url=page.url
                     return True
             return False
 
     async def run(self,request:str):
-        explicit=re.search(r'\b(?:solve|complete|do|answer)\s+(?:the\s+)?(?:next\s+)?(\d{1,2})\s+(?:questions|problems)\b',request,re.I)
-        goal=min(25,int(explicit.group(1))) if explicit else (25 if re.search(r'\b(?:all|entire)\s+(?:questions|problems|assignment|homework)\b',request,re.I) else 1)
-        goal=max(1,goal)
+        explicit=re.search(r'\b(?:solve|complete|do|answer|finish)\s+(?:the\s+)?(?:next\s+)?(\d+)\s+(?:questions|problems)\b',request,re.I)
+        full_assignment=(
+            re.search(
+                r'\b(?:all|every|entire|whole|full)\b.*\b(?:questions?|problems?|assignment|homework|deltamath|work)\b',
+                request,re.I)
+            or re.search(
+                r'\b(?:finish|complete|do(?:ing)?|solve|answer)\b.*\b(?:everything|all of (?:it|this))\b',
+                request,re.I)
+        )
+        goal=max(1,int(explicit.group(1))) if explicit else (None if full_assignment else 1)
         completed=0
-        for index in range(goal):
-            if index:
+        attempted=0
+        incorrect=0
+        next_question_ready=False
+        while goal is None or attempted < goal:
+            if attempted and not next_question_ready:
                 advanced=await self.advance_to_next()
                 if not advanced:
-                    return f'Website acceptance observed: {completed} question(s) completed (observed: {completed}). No unique Next Question control or no new question appeared.'
-            result=await self._run_single(request)
-            if 'Website acceptance observed:' not in result:
-                if completed:
-                    return f'Website acceptance observed: {completed} question(s) completed (observed: {completed}). Stopped: {result}'
-                return result
-            completed+=1
+                    result=f'Website acceptance observed: {completed} question(s) completed (observed: {completed}).'
+                    if incorrect:result+=f' {incorrect} incorrect question(s) recorded.'
+                    return result+' No next question or unfinished assignment skill was available.'
+            next_question_ready=False
+            # A supplied link selects the initial skill only. Later iterations
+            # must preserve navigation to the next question/unfinished skill.
+            question_request=request if not attempted else re.sub(r'https://[^\s<>\"\']+', '', request)
+            result=await self._run_single(question_request)
+            attempted+=1
+            if 'Website acceptance observed:' in result:
+                completed+=1
+                continue
+            if result.startswith('Website reported incorrect.') and (goal is None or goal>1):
+                incorrect+=1
+                if goal is not None and attempted>=goal:
+                    break
+                if not await self.advance_to_next():
+                    summary=f'Website acceptance observed: {completed} question(s) completed (observed: {completed}).'
+                    return summary+f' {incorrect} incorrect question(s) recorded; no next question was available.'
+                next_question_ready=True
+                continue
+            if completed:
+                summary=f'Website acceptance observed: {completed} question(s) completed (observed: {completed}).'
+                if incorrect:summary+=f' {incorrect} incorrect question(s) recorded.'
+                return summary+' Stopped: '+result
+            return result
+        if incorrect:
+            return (f'Website acceptance observed: {completed} question(s) completed (observed: {completed}). '
+                    f'{incorrect} incorrect question(s) recorded in {attempted} attempts.')
         if completed==1:
             return 'Website acceptance observed: 1 question completed (observed: 1).'
         return f'Website acceptance observed: {completed} question(s) completed (observed: {completed}).'

@@ -32,6 +32,8 @@ from unified_controller import UnifiedController,Journal
 from gemini_client import generate_json
 from gemini_budget import RATE
 from adaptive_math import MathMemory
+from subject_solver import subject_route
+from subject_browser import SubjectController
 
 MODEL=os.getenv('MODEL','gemini-3.5-flash-lite')
 PROFILE_DIR=Path(os.getenv('BROWSER_PROFILE_DIR') or (Path.home()/'.assignment-agent'/'chrome')).expanduser().resolve()
@@ -68,6 +70,8 @@ class SharedBrowser:
         self.profile_lock=None
         self.pw=None
         self.connection=None
+        self.subject_page=None
+        self.active_subject=False
     async def start(self):
         async with self.state_lock:
             if self.connection and self.connection.is_connected():return
@@ -265,7 +269,7 @@ TOOLS=[SimpleNamespace(name='solve_math_from_screenshot')]
 def build_graph():
     raise RuntimeError('The legacy LangGraph loop was removed to eliminate repeated tool calls. Use UnifiedController instead.')
 
-async def chat(message,history,request: gr.Request):
+async def chat(message,history,request: gr.Request,subject='Auto'):
     history=list(history or [])
     history.append({'role':'user','content':message})
     if await rate_limit_retry_after():
@@ -279,26 +283,44 @@ async def chat(message,history,request: gr.Request):
     async def worker():
         token=EVENTS.set(queue)
         try:
-            controller=UnifiedController(browser,delta,vision_solver,solve_math_impl,learn_example_impl,
-                        example_notes,MODEL,emit,PROFILE_DIR.parent/'answer_attempts.sqlite3',fast_mode=False,lookup=math_memory)
+            route=subject_route(message,subject,browser.active_subject)
+            browser.active_subject=route=='subject'
+            if route=='subject':
+                controller=SubjectController(browser,MODEL,emit,
+                    PROFILE_DIR.parent/'subject_attempts.sqlite3',subject)
+            else:
+                controller=UnifiedController(browser,delta,vision_solver,solve_math_impl,learn_example_impl,
+                            example_notes,MODEL,emit,PROFILE_DIR.parent/'answer_attempts.sqlite3',fast_mode=False,lookup=math_memory)
             async def invoke(resuming):
                 prompt=message
                 if resuming:prompt+=' Recovery after timeout: inspect current feedback; never resubmit a pending attempt.'
                 try:return await asyncio.wait_for(controller.run(prompt),timeout=REQUEST_SECONDS)
                 except (PlaywrightTimeoutError,TimeoutError) as exc:raise BrowserTimedOut(str(exc)) from exc
-            async def restart():await reopen_browser(controller.last_url)
-            async with TASK_LOCK:return await recover_once(invoke,restart,emit)
+            async def restart():
+                await reopen_browser(controller.last_url)
+            if TASK_LOCK.locked():emit('Waiting for the current task to release the browser.')
+            async with TASK_LOCK:
+                # Subject clicks can auto-grade. Never restart and replay an
+                # uncertain interaction on a different site.
+                if route=='subject':return await invoke(False)
+                return await recover_once(invoke,restart,emit)
         finally:EVENTS.reset(token)
     task=asyncio.create_task(worker())
     steps=[]
+    last_update=time.monotonic()
     try:
         while not task.done() or not queue.empty():
             try:
                 text=await asyncio.wait_for(queue.get(),timeout=.2)
                 steps.append(text)
+                last_update=time.monotonic()
                 history[-1]['content']='**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\nWorking…'
                 yield [dict(x) for x in history]
-            except asyncio.TimeoutError:pass
+            except asyncio.TimeoutError:
+                if time.monotonic()-last_update>=5 and not task.done():
+                    last_update=time.monotonic()
+                    history[-1]['content']=('**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\n' if steps else '')+f'Working — {time.monotonic()-started:.0f}s elapsed. Waiting for the current operation to finish.'
+                    yield [dict(x) for x in history]
         result=await task
         history[-1]['content']=('**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\n' if steps else '')+str(result)+f'\n\nFinished in {time.monotonic()-started:.1f}s.'
     except Exception as exc:
@@ -348,15 +370,22 @@ async def cancel_schedule(identity):return await asyncio.to_thread(schedule_stor
 async def allow_reviewed_retry():
     if TASK_LOCK.locked():return 'Stop the running task before allowing retry.'
     async with browser.lock:
+        if browser.active_subject and browser.subject_page is not None and not browser.subject_page.is_closed():
+            from subject_browser import READ_CARD,fingerprint
+            current=await browser.subject_page.evaluate(READ_CARD,uuid.uuid4().hex)
+            Journal(PROFILE_DIR.parent/'subject_attempts.sqlite3').clear(fingerprint(current))
+            return 'Retry allowed for the current subject card after your review of website feedback.'
         current=await delta.inspect(await browser.page())
         Journal(PROFILE_DIR.parent/'answer_attempts.sqlite3').clear(current['signature'])
     return 'Retry allowed for this question. Verify current feedback first.'
 
-with gr.Blocks(title='DeltaMath Study Agent') as demo:
-    gr.Markdown('# DeltaMath Study Agent\nOne controller: read → solve → enter → verify → feedback. Reads every question visually, with local symbolic checks when supported.')
+with gr.Blocks(title='Study Agent') as demo:
+    gr.Markdown('# Study Agent\nDeltaMath exact math checks, Spanish translation, English, social studies and science help. Subject answers receive an independent second check. Boom cards with readable answer controls can be answered one at a time; other sites receive suggestions.')
     bot=gr.Chatbot(height=520)
-    entry=gr.Textbox(label='Message',placeholder='Solve the visible DeltaMath problem, or paste its HTTPS DeltaMath URL.')
-    send=entry.submit(chat,[entry,bot],bot,concurrency_limit=1)
+    subject=gr.Dropdown(choices=['Auto','Math / DeltaMath','Spanish / Translation','English','Social studies','Science','General'],value='Auto',label='Subject')
+    entry=gr.Textbox(label='Message',placeholder='Paste an activity link, ask a subject question, or type Translate: followed by text.')
+    send_button=gr.Button('Send',variant='primary')
+    send=gr.on([entry.submit,send_button.click],chat,[entry,bot,subject],bot,concurrency_limit=1)
     send.then(lambda:'',outputs=entry)
     gr.Button('Stop').click(fn=None,cancels=[send])
     retry_box=gr.Textbox(label='Retry status',interactive=False)

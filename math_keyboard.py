@@ -18,7 +18,7 @@ async def enter_keyboard(field,latex,timeout_ms=120000):
     # Some custom math editors ignore Ctrl+A. Never append to an uncleared field.
     existing=await field.evaluate(READ)
     if existing is None:
-        existing=await field.evaluate('el => (el.innerText || "").trim()')
+        existing=await field.evaluate('el => ((el.querySelector(".mq-root-block") || el).textContent || "").trim()')
     if existing and existing.replace('\u200b','').replace('\ufeff','').strip():
         raise ValueError('Math editor did not clear; refusing to append duplicate digits')
     # Common structured LaTeX; use MathQuill keystrokes rather than raw LaTeX into a hidden textarea.
