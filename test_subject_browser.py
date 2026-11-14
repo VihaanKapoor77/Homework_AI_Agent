@@ -13,6 +13,31 @@ from test_subject_solver import candidate
 
 @unittest.skipUnless(os.getenv('RUN_BROWSER_TESTS')=='1','Set RUN_BROWSER_TESTS=1 for Chrome fixtures')
 class SubjectBrowserTests(unittest.IsolatedAsyncioTestCase):
+    async def test_complete_multiple_cards_in_other_subject_modes(self):
+        for subject in ('English','Science','Social studies'):
+            with self.subTest(subject=subject):
+                self.ctrl.subject=subject
+                await self.page.set_content('''<p id="question"></p><button id="answer" onclick="accept()">Answer</button><p id="status"></p>
+                <script>
+                window.submits=0;document.querySelector('#question').textContent='Question 1 '+Math.random();
+                function accept(){window.submits++;document.querySelector('#status').textContent='Correct!';
+                setTimeout(()=>{document.querySelector('#status').textContent='';
+                 if(window.submits===2){document.querySelector('#answer').remove();document.querySelector('#question').textContent='Entire deck complete';}
+                 else document.querySelector('#question').textContent='Question 2';},500);}
+                </script>''')
+                await self.page.evaluate('subject=>window.__studyAgentRound=subject',subject)
+                async def solve(request,card,image):
+                    done='Entire deck complete' in card['text']
+                    raw=candidate(action='complete' if done else 'answer')
+                    raw['question']=card['text']
+                    if not done:raw['target_id']=next(c['id'] for c in card['controls'] if c['label']=='Answer')
+                    return SubjectAnswer(**raw),SubjectCheck(correct=True,target_matches=True,reason='Checked')
+                self.ctrl.solver.solve=solve
+                result=await self.ctrl.run('Complete the whole current visible activity')
+                self.assertIn('Whole deck complete',result)
+                self.assertIn('2 answers accepted',result)
+                self.assertEqual(await self.page.evaluate('window.submits'),2)
+
     async def asyncSetUp(self):
         self.pw=await async_playwright().start()
         self.chrome=await self.pw.chromium.launch(headless=True,executable_path=os.getenv('TEST_CHROME_PATH') or None)
@@ -41,6 +66,12 @@ class SubjectBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Website acceptance observed',result)
         self.assertEqual(await self.page.evaluate('window.clicks'),1)
         self.assertIsNone(await self.page.evaluate('window.wrong'))
+
+    async def test_hidden_previous_card_does_not_duplicate_control_ids(self):
+        await self.page.evaluate('''()=>{const old=document.createElement('div');old.style.display='none';
+        old.innerHTML='<button data-subject-agent="check-0">Old answer</button>';document.body.append(old)}''')
+        result=await self.ctrl.run('Solve one visible card')
+        self.assertIn('Website acceptance observed',result)
 
     async def test_translation_never_clicks(self):
         result=await self.ctrl.run('Translate the visible card')
@@ -143,6 +174,22 @@ class SubjectBrowserTests(unittest.IsolatedAsyncioTestCase):
         result=await self.ctrl.fill_card(self.page,card,fingerprint(card),SubjectAnswer(**raw),'test')
         self.assertIn('does not match Origin',result)
         self.assertEqual(await self.page.locator('input').input_value(),'')
+
+    async def test_resuming_selected_category_does_not_toggle_it_off(self):
+        from subject_browser import READ_CARD,fingerprint
+        from spanish_rules import category_control
+        await self.page.set_content('<input value="es"><div style="display:flex">'+''.join(
+            f'<button class="ol_answer playItem {"ol_guess" if i==0 else ""}" role="button" onclick="this.classList.toggle(\'ol_guess\');window.clicked=true">{letter}</button>'
+            for i,letter in enumerate('DOCTOR'))+'</div><button onclick="document.querySelector(\'#status\').textContent=\'Correct!\'">Submit</button><p id="status"></p>')
+        card=await self.page.evaluate(READ_CARD,'resume')
+        raw=candidate(action='form',acronym='DOCTOR',category='Date',entries=[
+            dict(target_id=next(c['id'] for c in card['controls'] if c['kind']=='text'),value='es'),
+            dict(target_id=category_control(card['controls'],'DOCTOR','Date'),value='')])
+        self.ctrl.solver.verify_entry=AsyncMock(return_value=SubjectCheck(correct=True,target_matches=True,reason='Checked'))
+        result=await self.ctrl.fill_card(self.page,card,fingerprint(card),SubjectAnswer(**raw),'date')
+        self.assertIn('Website acceptance observed',result)
+        self.assertIsNone(await self.page.evaluate('window.clicked'))
+        self.assertEqual(await self.page.locator('.ol_guess').count(),1)
 
 
 if __name__=='__main__':unittest.main()

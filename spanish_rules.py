@@ -12,9 +12,11 @@ def category_control(controls,acronym,category):
     category=aliases.get(category.strip().casefold(),category.strip())
     indices=[i for i,name in enumerate(names) if name.casefold()==category.casefold()]
     if len(indices)!=1:raise ValueError('Use the full category name, not an ambiguous acronym letter.')
-    choices=sorted((c for c in controls if c.get('answer_choice') and not c['disabled']),key=lambda c:c['rect']['x'])
+    choices=sorted((c for c in controls if c.get('answer_choice')),key=lambda c:c['rect']['x'])
     if len(choices)!=len(names):raise ValueError('Could not identify all acronym tiles.')
     centers=[c['rect']['y']+c['rect']['height']/2 for c in choices]
     if max(centers)-min(centers)>min(c['rect']['height'] for c in choices)/2:
         raise ValueError('Category tiles are not in one readable row.')
-    return choices[indices[0]]['id']
+    chosen=choices[indices[0]]
+    if chosen['disabled']:raise ValueError('The requested category was already rejected or is disabled.')
+    return chosen['id']

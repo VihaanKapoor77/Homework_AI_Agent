@@ -1,6 +1,7 @@
 """Conservative subject-card adapter. DeltaMath never enters this controller."""
 from __future__ import annotations
 import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -26,19 +27,20 @@ READ_CARD=r'''token => {
       type:el.getAttribute('type')||'',
       label:el.getAttribute('aria-label') || (el.labels?[...el.labels].map(x=>x.innerText).join(' '):'') || el.innerText || el.getAttribute('placeholder') || el.value || '',
       rect:{x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)},
-      answer_choice:el.matches('.ol_answer[role="button"]'),
-      disabled:!!el.disabled || el.getAttribute('aria-disabled')==='true',
+      answer_choice:el.matches('.ol_answer[role="button"],.ol_guessWrong[role="button"]'),
+      selected:el.matches('.ol_answer.ol_guess[role="button"]') || el.getAttribute('aria-pressed')==='true',
+      disabled:!!el.disabled || el.getAttribute('aria-disabled')==='true' || el.classList.contains('ol_guessWrong'),
       options:el.tagName==='SELECT'?[...el.options].map(o=>o.label):[]};
  });
  const images=[...document.querySelectorAll('img')].filter(visible).map(el=>({src:el.currentSrc||el.src,alt:el.alt}));
  const backgrounds=[...document.querySelectorAll('div')].filter(visible).map(el=>getComputedStyle(el).backgroundImage).filter(x=>x && x!=='none');
- return {url:location.href,text:(document.body.innerText||'').slice(0,18000),controls,images,backgrounds};
+ return {url:location.href,round:window.__studyAgentRound||'',text:(document.body.innerText||'').slice(0,18000),controls,images,backgrounds};
 }'''
 
 
 def fingerprint(card):
     controls=[{k:v for k,v in c.items() if k not in ('id','rect')} for c in card['controls']]
-    return hashlib.sha256(json.dumps([card['url'],card['text'],controls,card.get('images'),card.get('backgrounds')],sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([card['url'],card['text'],controls,card.get('images'),card.get('backgrounds'),card.get('round','')],sort_keys=True).encode()).hexdigest()
 
 
 def boom_activity(url):
@@ -48,7 +50,25 @@ def boom_activity(url):
 
 def can_act(request):
     if re.search(r"\b(?:do not|don't|don’t|never)\s+(?:click|submit|enter|answer)|\b(?:explain only|translate|translation|suggest only)\b",request,re.I):return False
-    return bool(re.search(r'\b(?:solve|answer|complete|do|submit|enter|click)\b',request,re.I))
+    return bool(re.search(r'\b(?:solve|answer|complete|finish|do|submit|enter|click)\b',request,re.I))
+
+
+def whole_deck_request(request):
+    return can_act(request) and bool(re.search(r'\b(?:whole|entire|all|finish|complete)\b',request,re.I)) and not re.search(r'\b(?:one|1|single)\s+(?:card|question|exercise)\b',request,re.I)
+
+
+async def card_screenshot(page):
+    await page.bring_to_front()
+    try:return await page.screenshot(timeout=15000,animations='disabled')
+    except PlaywrightTimeoutError:
+        # Background/minimized Chrome can stall Playwright's frame/font wait.
+        # Capture the same viewport directly; never replay the previous action.
+        session=await page.context.new_cdp_session(page)
+        try:
+            shot=await asyncio.wait_for(session.send('Page.captureScreenshot',{
+                'format':'png','fromSurface':True,'captureBeyondViewport':False}),15)
+            return base64.b64decode(shot['data'])
+        finally:await session.detach()
 
 
 class SubjectController:
@@ -61,19 +81,48 @@ class SubjectController:
         self.last_url=None
 
     async def run(self,request):
-        for _ in range(5):
-            result=await self._run_once(request)
-            if result!='__instruction_advanced__':return result
+        whole=whole_deck_request(request)
+        completed=0
+        replans=0
+        corrections=0
+        self.rejected_plan=None
+        for _ in range(300 if whole else 20):
+            result=await asyncio.wait_for(self._run_once(request),timeout=300)
+            if result=='__deck_complete__':
+                return f'Whole deck complete: Boom completion screen verified. {completed} answers accepted during this run.'
+            if result.startswith('Website acceptance observed:') and whole:
+                completed+=1
+                replans=0
+                corrections=0
+                self.rejected_plan=None
+                self.emit(f'Card accepted ({completed} this run). Continuing until the deck completion screen.')
+                # Feedback is briefly displayed before Boom advances automatically.
+                await asyncio.sleep(3)
+            elif whole and result.startswith('Website reported incorrect.') and corrections<2:
+                corrections+=1
+                self.rejected_plan=getattr(self,'last_plan',None)
+                self.emit('Website explicitly rejected an answer. Rechecking the feedback before a corrected attempt.')
+                request=re.sub(r'https://[^\s<>"\']+','',request)+' Current visible card. Correct the explicitly rejected answer using the visible feedback: '+result
+                continue
+            elif (whole and result.startswith('Not entered:') and replans<2
+                  and getattr(self,'last_signature',None) and not self.journal.get(self.last_signature)):
+                replans+=1
+                self.emit('Rechecking an unsubmitted plan: '+result)
+                request=re.sub(r'https://[^\s<>"\']+','',request)+' Current visible card. Previous plan was rejected before interaction: '+result
+                continue
+            elif result!='__instruction_advanced__':
+                return (f'Deck paused after {completed} accepted answers; not complete.\n\n' if whole else '')+result
+            else:replans=0
             # After the first navigation, inspect the current card without
             # reloading the original activity link.
             request=re.sub(r'https://[^\s<>"\']+','',request)+' Current visible card.'
-        return 'Read five instruction cards. Ask again to continue from the current card.'
+        return f'Deck paused after {completed} accepted answers: progress limit reached; completion was not verified.'
 
     async def _run_once(self,request):
         url=request_url(request)
         active=getattr(self.browser,'subject_page',None)
         use_page=bool(url or (active is not None and not active.is_closed() and
-            re.search(r'\b(?:visible|current (?:page|card|question)|next (?:one|card|question)|this (?:card|page|activity)|continue)\b|^\s*(?:solve|answer|do|complete|translate)\s+(?:it|this|another)\b',request,re.I)))
+            (whole_deck_request(request) or re.search(r'\b(?:visible|current (?:page|card|question)|next (?:one|card|question)|this (?:card|page|activity)|continue)\b|^\s*(?:solve|answer|do|complete|translate)\s+(?:it|this|another)\b',request,re.I))))
         prompt='Subject: '+self.subject+'\n'+request
         if not use_page:
             answer,check=await self.solver.solve(prompt)
@@ -104,18 +153,36 @@ class SubjectController:
                 play=page.locator('button.fastPlay')
                 if await play.count()==1 and await play.is_visible():
                     await play.click(timeout=10000)
+                    # A deliberately started play round must not inherit answer
+                    # attempts from an earlier round of this same deck.
+                    await page.evaluate('token => window.__studyAgentRound=token',uuid.uuid4().hex)
                     await asyncio.sleep(3)
+            # The accent keyboard can cover another blank on multi-input cards.
+            # Dismiss focus before discovering the complete form and capturing it.
+            await page.locator('input:focus,textarea:focus').evaluate_all('els=>els.forEach(el=>el.blur())')
+            await asyncio.sleep(.15)
             card=await page.evaluate(READ_CARD,uuid.uuid4().hex)
             if 'Waiting for connection to server' in card['text']:
                 return 'Boom is disconnected from its server. No answer was entered; reconnect or reload the activity before retrying.'
             signature=fingerprint(card)
-            if self.journal.get(signature):
+            self.last_signature=signature
+            previous=self.journal.get(signature)
+            if previous and not (previous=='rejected' and getattr(self,'rejected_plan',None)):
                 return 'Previous subject-card attempt recorded. Check website feedback before retrying; no automatic repeat.'
             self.emit('Reading the card, translating when needed, and checking the answer independently.')
-            answer,check=await self.solver.solve(prompt,card,await page.screenshot(timeout=30000))
+            answer,check=await self.solver.solve(prompt,card,await card_screenshot(page))
             report=self.solver.report(answer,check)
             if not check or not check.correct or not check.target_matches or answer.uncertainty or answer.needs_source:
                 return report
+            plan=(answer.action,answer.category.strip().casefold(),tuple(e.value.strip().casefold() for e in answer.entries),
+                  answer.answer.strip().casefold() if not answer.entries else '')
+            if plan==getattr(self,'rejected_plan',None):
+                return 'Not entered: the new plan repeats the explicitly rejected answer.'
+            self.last_plan=plan
+            if answer.action=='complete':
+                if boom_activity(page.url) and not any(c['kind'] in ('text','select','drag_source','drag_target') or c.get('answer_choice') for c in card['controls']):
+                    return '__deck_complete__'
+                return 'Not complete: answer controls remain on the current card.'
             if not can_act(request) or answer.action=='report':return report+'\n\nSuggestion only; no website answer entered.'
             if not boom_activity(page.url):
                 return report+'\n\nSuggestion only: automatic answering is supported on Boom activity cards with readable controls.'
@@ -137,7 +204,7 @@ class SubjectController:
             if control['type'] in ('password','file','email','checkbox','radio'):
                 return 'Not entered: this control type needs a dedicated adapter.'
             # Detect card changes during model calls, without changing target IDs.
-            fresh=await page.evaluate(READ_CARD,'check')
+            fresh=await page.evaluate(READ_CARD,uuid.uuid4().hex)
             if fingerprint(fresh)!=signature:return 'Not entered: the card changed during verification. Ask again for the current card.'
             index=card['controls'].index(control)
             target=page.locator('[data-subject-agent="'+fresh['controls'][index]['id']+'"]')
@@ -180,9 +247,11 @@ class SubjectController:
     async def wait_feedback(self,page,signature,report):
         for _ in range(20):
             await asyncio.sleep(.25)
-            bad=page.get_by_text(re.compile(r'^(?:incorrect[.!]?|try again[.!]?|not quite[.!]?)$',re.I)).filter(visible=True)
+            bad=page.get_by_text(re.compile(r'^(?:incorrect[.!]?|try again[.!]?|not quite[.!]?|You have not found all the correct answers[.!]?)$',re.I)).filter(visible=True)
             good=page.get_by_text(re.compile(r'^(?:correct[.!]?|great job[.!]?|well done[.!]?)$',re.I)).filter(visible=True)
-            if await bad.count():return 'Website reported incorrect. Stopped without retrying.\n\n'+report
+            if await bad.count():
+                self.journal.set(signature,'rejected')
+                return 'Website reported incorrect.\n\n'+report
             if await good.count():
                 self.journal.set(signature,'accepted')
                 return 'Website acceptance observed: 1 subject question completed.\n\n'+report
@@ -207,7 +276,7 @@ class SubjectController:
                 return 'Stopped before submission: a matching control changed.'
             await source.drag_to(target,timeout=10000)
         self.emit('Checking the completed matching layout before submitting.')
-        check=await self.solver.verify_entry(answer,card,await page.screenshot(timeout=30000))
+        check=await self.solver.verify_entry(answer,card,await card_screenshot(page))
         if not check.correct or not check.target_matches:
             return 'Not submitted: matching placement verification failed. '+check.reason
         if not await self.submit_observed(page):return 'Not submitted: no unique visible Submit control.'
@@ -258,8 +327,12 @@ class SubjectController:
             elif control['kind']=='select':await target.select_option(label=entry.value,timeout=10000)
             else:
                 self.emit('Selecting the verified category: '+answer.answer)
-                await target.click(timeout=10000)
-        check=await self.solver.verify_entry(answer,card,await page.screenshot(timeout=30000))
+                already_selected=await target.evaluate("el=>el.classList.contains('ol_guess') || el.getAttribute('aria-pressed')==='true'")
+                if not already_selected:
+                    await target.click(timeout=10000)
+                if await target.evaluate("el=>el.classList.contains('playItem') && !el.classList.contains('ol_guess')"):
+                    return 'Not submitted: category selection did not remain selected.'
+        check=await self.solver.verify_entry(answer,card,await card_screenshot(page))
         if not check.correct or not check.target_matches:
             return 'Not submitted: full-card verification failed. '+check.reason
         if not await self.submit_observed(page):return 'Answer entered and checked; no unique Submit control.'

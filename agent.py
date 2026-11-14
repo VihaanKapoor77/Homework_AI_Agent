@@ -33,7 +33,7 @@ from gemini_client import generate_json
 from gemini_budget import RATE
 from adaptive_math import MathMemory
 from subject_solver import subject_route
-from subject_browser import SubjectController
+from subject_browser import SubjectController,whole_deck_request
 
 MODEL=os.getenv('MODEL','gemini-3.5-flash-lite')
 PROFILE_DIR=Path(os.getenv('BROWSER_PROFILE_DIR') or (Path.home()/'.assignment-agent'/'chrome')).expanduser().resolve()
@@ -296,7 +296,10 @@ async def chat(message,history,request: gr.Request,subject='Auto'):
                 if resuming:
                     prompt=re.sub(r'https://[^\s<>\"\']+', '', prompt)
                     prompt+=' Recovery after timeout: inspect current feedback; never resubmit a pending attempt.'
-                try:return await asyncio.wait_for(controller.run(prompt),timeout=REQUEST_SECONDS)
+                # Whole decks use bounded per-card operations; a fixed total
+                # request timeout would interrupt healthy progress on long decks.
+                timeout=None if route=='subject' and whole_deck_request(prompt) else REQUEST_SECONDS
+                try:return await asyncio.wait_for(controller.run(prompt),timeout=timeout)
                 except (PlaywrightTimeoutError,TimeoutError) as exc:raise BrowserTimedOut(str(exc)) from exc
             async def restart():
                 await reopen_browser(controller.last_url)
@@ -324,7 +327,7 @@ async def chat(message,history,request: gr.Request,subject='Auto'):
                     history[-1]['content']=('**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\n' if steps else '')+f'Working — {time.monotonic()-started:.0f}s elapsed. Waiting for the current operation to finish.'
                     yield [dict(x) for x in history]
         result=await task
-        elapsed_label='Paused after' if 'whole-assignment completion is NOT confirmed' in str(result) else 'Finished in'
+        elapsed_label='Paused after' if 'whole-assignment completion is NOT confirmed' in str(result) or str(result).startswith('Deck paused') else 'Finished in'
         history[-1]['content']=('**Steps**\n'+'\n'.join('- '+x for x in steps[-12:])+'\n\n' if steps else '')+str(result)+f'\n\n{elapsed_label} {time.monotonic()-started:.1f}s.'
     except Exception as exc:
         history[-1]['content']=error('AGENT_ERROR',f'{type(exc).__name__}: {exc}')
@@ -383,7 +386,7 @@ async def allow_reviewed_retry():
     return 'Retry allowed for this question. Verify current feedback first.'
 
 with gr.Blocks(title='Study Agent') as demo:
-    gr.Markdown('# Study Agent\nDeltaMath exact math checks, Spanish translation, English, social studies and science help. Subject answers receive an independent second check. Boom cards with readable answer controls can be answered one at a time; other sites receive suggestions.')
+    gr.Markdown('# Study Agent\nDeltaMath exact math checks, Spanish translation, English, social studies and science help. Subject answers receive an independent second check. Ask to complete the whole Boom deck, or specify one card. Other sites receive suggestions.')
     bot=gr.Chatbot(height=520)
     subject=gr.Dropdown(choices=['Auto','Math / DeltaMath','Spanish / Translation','English','Social studies','Science','General'],value='Auto',label='Subject')
     entry=gr.Textbox(label='Message',placeholder='Paste an activity link, ask a subject question, or type Translate: followed by text.')

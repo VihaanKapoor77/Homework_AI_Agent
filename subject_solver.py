@@ -4,8 +4,9 @@ import json
 import re
 from typing import Literal
 from urllib.parse import urlsplit
-from pydantic import BaseModel, ConfigDict, StrictBool, Field
+from pydantic import BaseModel, ConfigDict, StrictBool, Field, ValidationError
 from gemini_client import generate_json
+from spanish_rules import category_control
 
 
 def request_url(request):
@@ -53,7 +54,7 @@ class SubjectAnswer(BaseModel):
     value:str
     uncertainty:str
     needs_source:StrictBool
-    action:Literal['answer','instruction','match','form','report']='answer'
+    action:Literal['answer','instruction','match','form','report','complete']='answer'
     matches:list[MatchPair]=Field(default_factory=list)
     entries:list[FormEntry]=Field(default_factory=list)
     acronym:Literal['','DOCTOR','PLACE']=''
@@ -88,6 +89,10 @@ For translation requests return the requested translation and explain ambiguity.
 For an instruction-only card with no question or answer input, set action="instruction",
 explain its lesson as answer, and select the observed Next control. Never use instruction
 to skip an unanswered question. Otherwise use action="answer" or "report".
+Use action="complete" ONLY when the visible website explicitly shows the entire
+deck/session is finished (a final results/completion screen with no unanswered card).
+A Correct message for one card, a Next button, or your own answer is NOT deck completion.
+For complete, describe the actual completion evidence in question, answer and reason.
 For browser answers select ONLY an observed answer control ID; never invent IDs,
 selectors or coordinates. Never select login, account, payment, navigation, delete,
 skip or help controls as answers. If no suitable control exists, target_id="" and
@@ -98,8 +103,13 @@ include BOTH the text field with its verb AND the appropriate category button wi
 value="". Fill fields before category clicks. Also use form for multiple input fields.
 DOCTOR = Description/date, Origin, Characteristics, Time, Occupation, Relationships.
 The FIRST O (second button) is Origin; the SECOND O (fifth button) is Occupation.
-PLACE = Position, Location, Action, Condition, Emotions. P is posture/position, L is
-location, A is an ongoing action, C a condition, E an emotion. Read the full sentence.
+PLACE = Position, Location, Action, Condition, Emotions. P is posture or relative
+position (under/below, above/on top of, beside, in front of another object).
+L is the location of a person/object at a place or geographic location. A is an
+ongoing action, C a condition, E an emotion. Follow the supplied lesson's distinctions.
+When correcting explicit website rejection, use the visible rejected/correct marks
+and original question to independently reconsider the answer. Never just repeat the
+rejected category or guess successive choices. Preserve already-correct fields.
 Image-only category buttons may have empty labels: map their observed rect positions
 to the screenshot, using the exact observed ID, never guessed coordinates.
 An answer with only the conjugation or only the category is INCOMPLETE. State both
@@ -119,10 +129,19 @@ class SubjectSolver:
         self.model=model
         self.generate=generate
 
+    async def checked_response(self,prompt,image):
+        for attempt in range(3):
+            raw=await self.generate(prompt,image,self.model)
+            try:return SubjectCheck.model_validate(raw)
+            except ValidationError:
+                if attempt==2:
+                    return SubjectCheck(correct=False,target_matches=False,reason='Verification repeatedly returned an invalid response; no submission approved.')
+                prompt+='\nYour response must contain ONLY correct (boolean), target_matches (boolean), and reason (string). Do not return an answer plan. Independently perform the requested verification.'
+
     async def solve(self,request,observed=None,image=None):
         payload={'request':request,'observed':observed or {}}
         raw=await self.generate(GUIDANCE+'\nReturn JSON with ALL fields: '
-            '{action:"answer|instruction|match|form|report",subject:string,question:string,answer:string,translation:string,reason:string,'
+            '{action:"answer|instruction|match|form|report|complete",subject:string,question:string,answer:string,translation:string,reason:string,'
             'target_id:string,value:string,acronym:"DOCTOR|PLACE|",category:string,entries:[{target_id:string,value:string}],matches:[{source_id:string,target_id:string}],uncertainty:string,needs_source:boolean}.\n'+
             json.dumps(payload,ensure_ascii=False),image,self.model)
         answer=SubjectAnswer.model_validate(raw)
@@ -130,25 +149,43 @@ class SubjectSolver:
             raise ValueError('No readable question or answer was returned.')
         if answer.uncertainty or answer.needs_source:
             return answer,None
+        controls=(observed or {}).get('controls',[])
+        if (answer.action=='answer' and re.search(r'\binstruction(?:-only)? card\b',answer.question+' '+answer.answer,re.I)
+            and not any(c['kind'] in ('text','select','drag_source','drag_target') or c.get('answer_choice') for c in controls)
+            and any(c['id']==answer.target_id and c['label'].strip()=='Next' for c in controls)):
+            answer.action='instruction'
+        # Resolve semantic categories against the observed row before verification.
+        # Image-only tiles have opaque IDs, which the model can confuse even when
+        # it correctly identifies the Spanish category.
+        if answer.action=='form' and answer.acronym:
+            controls=(observed or {}).get('controls',[])
+            choices={c['id'] for c in controls if c.get('answer_choice') and not c.get('disabled')}
+            selected=[entry for entry in answer.entries if entry.target_id in choices]
+            if len(selected)==1:
+                try:
+                    expected=category_control(controls,answer.acronym,answer.category)
+                except ValueError:
+                    pass  # Keep malformed/ambiguous plans subject to existing guards.
+                else:
+                    selected[0].target_id=expected
         # A second call checks the original problem independently before acting.
-        raw=await self.generate(GUIDANCE+'\nIndependently solve the original question first, '
+        check=await self.checked_response(GUIDANCE+'\nIndependently solve the original question first, '
             'then check the proposed answer. Reject wrong conjugation, mistranslation, '
             'unsupported claims or insufficient context. target_matches is true only if the '
             'chosen observed control/value expresses the answer (or no control is needed for '
             'a text-only response). Return {correct:boolean,target_matches:boolean,reason:string}.\n'+
-            json.dumps({**payload,'proposed':answer.model_dump()},ensure_ascii=False),image,self.model)
-        return answer,SubjectCheck.model_validate(raw)
+            json.dumps({**payload,'proposed':answer.model_dump()},ensure_ascii=False),image)
+        return answer,check
 
     async def verify_entry(self,answer,card,image):
-        raw=await self.generate(GUIDANCE+'\nInspect the COMPLETED card screenshot. '
+        return await self.checked_response(GUIDANCE+'\nInspect the COMPLETED card screenshot. '
             'For matching, check every word is placed in the correct target and none remain. '
             'For forms, check every field value AND every required category selection. '
             'For DOCTOR/PLACE verify the correct category button is visibly selected, not just '
             'that the verb is entered. A missing or wrong category means false. Return '
             '{correct:boolean,target_matches:boolean,reason:string}. If any placement is '
             'unreadable or incomplete, return false.\n'+json.dumps({'original':card,
-            'expected':answer.model_dump()},ensure_ascii=False),image,self.model)
-        return SubjectCheck.model_validate(raw)
+            'expected':answer.model_dump()},ensure_ascii=False),image)
 
     @staticmethod
     def report(answer,check):

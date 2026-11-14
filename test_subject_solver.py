@@ -21,6 +21,13 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(category_control(tiles(5),'PLACE','Location'),'1')
         with self.assertRaises(ValueError):category_control(tiles(6),'DOCTOR','O')
 
+    def test_rejected_tile_keeps_its_place_in_the_row(self):
+        from spanish_rules import category_control
+        controls=[dict(id=str(i),answer_choice=True,disabled=i==1,rect=dict(x=i*100,y=100,height=80)) for i in range(5)]
+        self.assertEqual(category_control(controls,'PLACE','Position'),'0')
+        self.assertEqual(category_control(controls,'PLACE','Condition'),'3')
+        with self.assertRaises(ValueError):category_control(controls,'PLACE','Location')
+
     def test_delta_url_always_uses_math(self):
         for subject in ('Auto','Spanish / Translation','English','General'):
             self.assertEqual(subject_route('https://www.deltamath.com/app/student/123',subject,True),'math')
@@ -47,6 +54,52 @@ class RoutingTests(unittest.TestCase):
 
 
 class SolverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_entry_check_retries_verification_only(self):
+        generate=AsyncMock(side_effect=[candidate(),dict(correct=True,target_matches=True,reason='Visible entry checked')])
+        check=await SubjectSolver('test',generate).verify_entry(SubjectAnswer(**candidate()),{},b'image')
+        self.assertTrue(check.correct)
+        self.assertEqual(generate.await_count,2)
+        self.assertIn('ONLY correct',generate.call_args.args[0])
+
+    async def test_repeated_malformed_check_does_not_approve(self):
+        generate=AsyncMock(return_value=candidate())
+        check=await SubjectSolver('test',generate).verify_entry(SubjectAnswer(**candidate()),{},b'image')
+        self.assertFalse(check.correct)
+        self.assertEqual(generate.await_count,3)
+
+    async def test_category_mapping_is_resolved_before_independent_check(self):
+        import json
+        for acronym,category,index in [('DOCTOR','Characteristics',2),('DOCTOR','Origin',1),('DOCTOR','Occupation',4),('PLACE','Location',1)]:
+            with self.subTest(category=category):
+                controls=[dict(id=str(i),kind='button',answer_choice=True,disabled=False,
+                    rect=dict(x=i*100,y=100,height=80)) for i in range(len(acronym))]
+                raw=candidate(action='form',acronym=acronym,category=category,
+                    entries=[dict(target_id='verb',value='soy'),dict(target_id='0',value='')])
+                generate=AsyncMock(side_effect=[raw,dict(correct=True,target_matches=True,reason='Checked')])
+                answer,_=await SubjectSolver('test',generate).solve('visible card',{'controls':controls})
+                self.assertEqual(answer.entries[1].target_id,str(index))
+                self.assertEqual(answer.entries[0].value,'soy')
+                proposed=json.loads(generate.call_args_list[1].args[0].split('\n')[-1])['proposed']
+                self.assertEqual(proposed['entries'][1]['target_id'],str(index))
+
+    async def test_unknown_category_target_is_not_replaced(self):
+        raw=candidate(action='form',acronym='DOCTOR',category='Characteristics',
+            entries=[dict(target_id='unknown',value='')])
+        generate=AsyncMock(side_effect=[raw,dict(correct=False,target_matches=False,reason='Unknown target')])
+        answer,check=await SubjectSolver('test',generate).solve('visible card',{'controls':[]})
+        self.assertEqual(answer.entries[0].target_id,'unknown')
+        self.assertFalse(check.target_matches)
+
+    async def test_ambiguous_or_incomplete_category_layout_is_not_repaired(self):
+        for category,count in [('O',6),('Origin',5)]:
+            controls=[dict(id=str(i),answer_choice=True,disabled=False,
+                rect=dict(x=i*100,y=100,height=80)) for i in range(count)]
+            raw=candidate(action='form',acronym='DOCTOR',category=category,
+                entries=[dict(target_id='0',value='')])
+            generate=AsyncMock(side_effect=[raw,dict(correct=False,target_matches=False,reason='Ambiguous')])
+            answer,_=await SubjectSolver('test',generate).solve('visible card',{'controls':controls})
+            self.assertEqual(answer.entries[0].target_id,'0')
+
     async def test_translation_and_independent_check(self):
         generate=AsyncMock(side_effect=[candidate(),dict(correct=True,target_matches=True,reason='Verified conjugation')])
         solver=SubjectSolver('test',generate)
