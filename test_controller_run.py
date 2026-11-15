@@ -1,12 +1,49 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock,patch
 
 from unified_controller import UnifiedController
 
 
 class ControllerRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_does_not_timeout_healthy_continuing_math(self):
+        import asyncio
+        import agent
+        from types import SimpleNamespace
+        async def run(prompt):
+            await asyncio.sleep(.02)
+            return 'Whole assignment complete: confirmed by the website.'
+        async def recover(invoke,restart,emit):
+            return await invoke(False)
+        for prompt in ('Finish this assignment','Solve 2 questions'):
+            controller=SimpleNamespace(run=run)
+            with patch.object(agent,'UnifiedController',return_value=controller) as factory, \
+                 patch.object(agent,'REQUEST_SECONDS',.001), \
+                 patch.object(agent,'TASK_LOCK',asyncio.Lock()), \
+                 patch.object(agent,'rate_limit_retry_after',AsyncMock(return_value=0)), \
+                 patch.object(agent,'subject_route',return_value='math'), \
+                 patch.object(agent,'browser',SimpleNamespace(active_subject=False)), \
+                 patch.object(agent,'recover_once',recover):
+                factory.question_goal=UnifiedController.question_goal
+                updates=[update async for update in agent.chat(prompt,[],None)]
+            self.assertIn('Whole assignment complete',updates[-1][-1]['content'])
+
+    async def test_dont_stop_continues_until_verified_completion(self):
+        for prompt in ("Solve and don't stop",'Keep going','Do not stop','Keep working until nothing remains'):
+            with self.subTest(prompt=prompt),tempfile.TemporaryDirectory() as directory:
+                controller=self.make_controller(directory)
+                controller._run_single=AsyncMock(return_value='Website acceptance observed: 1 question completed.')
+                controller.advance_to_next=AsyncMock(side_effect=[True,False])
+                controller.assignment_complete=AsyncMock(return_value=True)
+                result=await controller.run(prompt)
+                self.assertEqual(controller._run_single.await_count,2)
+                self.assertIn('Whole assignment complete',result)
+
+    def test_explicit_scope_overrides_persistence(self):
+        self.assertEqual(UnifiedController.question_goal('Solve 2 questions and never stop'),2)
+        self.assertEqual(UnifiedController.question_goal('Complete this question and keep going'),1)
+
     async def test_resumes_completed_question_without_reopening_initial_link(self):
         with tempfile.TemporaryDirectory() as directory:
             controller=self.make_controller(directory)

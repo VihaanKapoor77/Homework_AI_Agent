@@ -54,7 +54,8 @@ def can_act(request):
 
 
 def whole_deck_request(request):
-    return can_act(request) and bool(re.search(r'\b(?:whole|entire|all|finish|complete)\b',request,re.I)) and not re.search(r'\b(?:one|1|single)\s+(?:card|question|exercise)\b',request,re.I)
+    persistent=bool(re.search(r"\b(?:never stop|don['’]?t stop|do not stop|keep going|keep working)\b",request,re.I))
+    return can_act(request) and (persistent or bool(re.search(r'\b(?:whole|entire|all|finish|complete)\b',request,re.I))) and not re.search(r'\b(?:one|1|single)\s+(?:card|question|exercise)\b',request,re.I)
 
 
 async def card_screenshot(page):
@@ -86,7 +87,9 @@ class SubjectController:
         replans=0
         corrections=0
         self.rejected_plan=None
-        for _ in range(300 if whole else 20):
+        steps=0
+        while whole or steps<20:
+            steps+=1
             result=await asyncio.wait_for(self._run_once(request),timeout=300)
             if result=='__deck_complete__':
                 return f'Whole deck complete: Boom completion screen verified. {completed} answers accepted during this run.'

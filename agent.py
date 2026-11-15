@@ -296,9 +296,11 @@ async def chat(message,history,request: gr.Request,subject='Auto'):
                 if resuming:
                     prompt=re.sub(r'https://[^\s<>\"\']+', '', prompt)
                     prompt+=' Recovery after timeout: inspect current feedback; never resubmit a pending attempt.'
-                # Whole decks use bounded per-card operations; a fixed total
-                # request timeout would interrupt healthy progress on long decks.
-                timeout=None if route=='subject' and whole_deck_request(prompt) else REQUEST_SECONDS
+                # Continuing tasks retain per-operation timeouts, but healthy
+                # progress must not be cut short by a total wall-clock deadline.
+                continuous=(whole_deck_request(prompt) if route=='subject'
+                            else UnifiedController.question_goal(prompt)!=1)
+                timeout=None if continuous else REQUEST_SECONDS
                 try:return await asyncio.wait_for(controller.run(prompt),timeout=timeout)
                 except (PlaywrightTimeoutError,TimeoutError) as exc:raise BrowserTimedOut(str(exc)) from exc
             async def restart():

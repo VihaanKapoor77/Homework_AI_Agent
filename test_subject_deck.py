@@ -5,6 +5,24 @@ from subject_browser import SubjectController,whole_deck_request
 
 
 class DeckTests(unittest.IsolatedAsyncioTestCase):
+    async def test_whole_deck_has_no_300_step_cutoff(self):
+        ctrl=self.controller(['Website acceptance observed: correct']*305+['__deck_complete__'])
+        with patch('subject_browser.asyncio.sleep',new=AsyncMock()):
+            result=await ctrl.run("Answer the deck and don't stop")
+        self.assertIn('Whole deck complete',result)
+        self.assertIn('305 answers accepted',result)
+        self.assertEqual(ctrl._run_once.await_count,306)
+
+    async def test_continuous_run_is_cancellable(self):
+        import asyncio
+        ctrl=self.controller([asyncio.CancelledError()])
+        with self.assertRaises(asyncio.CancelledError):
+            await ctrl.run('Complete the whole deck')
+
+    def test_persistence_does_not_override_no_submission(self):
+        self.assertFalse(whole_deck_request("Don't submit; keep going"))
+        self.assertFalse(whole_deck_request('Translate the whole deck and never stop'))
+
     def controller(self,results):
         ctrl=object.__new__(SubjectController)
         ctrl.emit=lambda _:None

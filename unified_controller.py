@@ -146,7 +146,7 @@ class UnifiedController:
     def submission_requested(request):
         if re.search(r"\b(?:don't|do not|never|not)\s+(?:submit|send|grade)\b|\bwithout\s+submitting\b",request,re.I):
             return False
-        return bool(re.search(r'\b(?:solve|answer|do|doing|complete|finish|submit)\b',request,re.I))
+        return bool(re.search(r"\b(?:solve|answer|do|doing|complete|finish|submit|keep going|keep working|never stop|don['’]?t stop)\b",request,re.I))
 
     async def observe(self,page):
         snapshot=await self.delta.inspect(page)
@@ -735,7 +735,8 @@ class UnifiedController:
             return summary+' Whole assignment complete: confirmed by the website.'
         return summary+' Paused: whole-assignment completion is NOT confirmed. No unique next question or unfinished skill could be opened; check the assignment overview.'
 
-    async def run(self,request:str):
+    @staticmethod
+    def question_goal(request:str):
         explicit=re.search(r'\b(?:solve|complete|do|answer|finish)\s+(?:the\s+)?(?:next\s+)?(\d+)\s+(?:questions|problems)\b',request,re.I)
         full_assignment=(
             re.search(
@@ -745,8 +746,13 @@ class UnifiedController:
                 r'\b(?:finish|complete|do(?:ing)?|solve|answer)\b.*\b(?:everything|all of (?:it|this)|(?:whole|entire|full)\s+(?:thing|task))\b',
                 request,re.I)
             or re.search(r'\b(?:finish|complete|do)\b.*\b(?:assignment|homework)\b',request,re.I)
+            or re.search(r"\b(?:never stop|don['’]?t stop|do not stop|keep going|keep working|until (?:everything|nothing))\b",request,re.I)
         )
-        goal=max(1,int(explicit.group(1))) if explicit else (None if full_assignment else 1)
+        single=re.search(r'\b(?:one|single|current|this)\s+(?:question|problem)\b',request,re.I)
+        return max(1,int(explicit.group(1))) if explicit else (1 if single else None if full_assignment else 1)
+
+    async def run(self,request:str):
+        goal=self.question_goal(request)
         completed=0
         attempted=0
         incorrect=0
