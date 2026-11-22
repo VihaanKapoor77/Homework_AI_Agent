@@ -24,6 +24,8 @@ async def enter_keyboard(field,latex,timeout_ms=120000):
     # Common structured LaTeX; use MathQuill keystrokes rather than raw LaTeX into a hidden textarea.
     # Complex forms requiring geometry templates are intentionally left for visual/manual entry.
     def tokens(value):
+        # MathQuill uses Space to leave a group; LaTeX spacing is not a keystroke.
+        value=re.sub(r'\s+','',value.replace(r'\left','').replace(r'\right',''))
         i=0
         while i<len(value):
             if value.startswith(r'\frac{',i):
@@ -34,14 +36,21 @@ async def enter_keyboard(field,latex,timeout_ms=120000):
                 if den_end<0 or any(ch in numerator+value[end+2:den_end] for ch in '{}\\'):
                     raise ValueError('Complex fraction needs MathQuill API')
                 yield ('fraction',numerator,value[end+2:den_end]);i=den_end+1
+            elif value[i]=='^':
+                match=re.match(r'\^(?:\{([+-]?\d+)\}|([0-9]))',value[i:])
+                if not match:raise ValueError('Unsupported exponent in keyboard fallback')
+                yield ('power',match[1] or match[2]);i+=len(match[0])
             elif value.startswith(r'\pi',i):
                 yield ('write','pi');i+=3
-            elif value[i]=='\\':
+            elif value[i] in '\\{}':
                 raise ValueError('Unsupported LaTeX in keyboard fallback; use MathQuill API')
             else:
                 yield ('write',value[i]);i+=1
     for token in tokens(latex):
-        if token[0]=='fraction':
+        if token[0]=='power':
+            await field.press_sequentially('^'+token[1],delay=5,timeout=timeout_ms)
+            await field.press('ArrowRight',timeout=timeout_ms)
+        elif token[0]=='fraction':
             await field.press('/',timeout=timeout_ms)
             await field.press_sequentially(token[1],delay=5,timeout=timeout_ms)
             await field.press('ArrowDown',timeout=timeout_ms)

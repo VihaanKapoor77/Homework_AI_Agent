@@ -7,6 +7,34 @@ from unified_controller import Plan, Check, geometry_valid, feedback_status, Uni
 from math_keyboard import enter_keyboard
 
 class UnitTests(unittest.TestCase):
+    def test_point_reflection_over_y_equals_x_matches_visible_choice(self):
+        controller=object.__new__(UnifiedController)
+        snapshot={
+            'question_text':'Reflection over the line y = x of the point (−5, 2)',
+            'fields':[
+                {'kind':'radio_option','label':'(−2, −5)'},
+                {'kind':'radio_option','label':'(2, 5)'},
+                {'kind':'radio_option','label':'(5, 2)'},
+                {'kind':'radio_option','label':'(2, −5)'},
+            ],
+        }
+        plan=controller.point_reflection_plan(snapshot,'Answer this question')
+        self.assertEqual(plan.answers,['(2, −5)'])
+        self.assertEqual(plan.method,'point reflection')
+
+    def test_point_reflection_requires_one_visible_matching_choice(self):
+        controller=object.__new__(UnifiedController)
+        snapshot={
+            'question_text':'Reflection over the line y = x of the point (−5, 2)',
+            'fields':[
+                {'kind':'radio_option','label':'(2, −5)'},
+                {'kind':'radio_option','label':'(2, −5)'},
+            ],
+        }
+        plan=controller.point_reflection_plan(snapshot,'Answer this question')
+        self.assertEqual(plan.action,'report')
+        self.assertFalse(plan.answers)
+
     def test_vertical_is_not_linear_pair(self):
         p=Plan(action='answer',summary='test',geometry_relation='linear_pair',vertex='G',target_rays=['C','B'],answer_rays=['D','A'],opposite_rays=[['C','D'],['A','B']])
         self.assertFalse(geometry_valid(p))

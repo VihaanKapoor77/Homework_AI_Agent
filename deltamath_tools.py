@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from settings import ACTION_MS, READY_MS
 from math_keyboard import enter_keyboard
 from playwright.async_api import Error as PlaywrightError
+import unicodedata
 
 
 def is_deltamath(url: str) -> bool:
@@ -34,11 +35,32 @@ def _canonical_option_label(value: str) -> str:
     return re.sub(r'\s+',' ',value).strip()
 
 
+_ALL_SPACES_RE = re.compile(r'[\s\u200b-\u200d\ufeff]+', re.UNICODE)
+
+
+def _clean_spaces(text: str) -> str:
+    if not text:
+        return ""
+    # Normalize compatibility characters (e.g., full-width spaces \u3000 -> standard ASCII space)
+    normalized = unicodedata.normalize("NFKC", text)
+    return _ALL_SPACES_RE.sub(" ", normalized).strip()
+
+
 def visible_option_label(value: str) -> str:
-    lines=[line.strip() for line in value.splitlines() if line.strip()]
-    if len(lines)>1 and _canonical_option_label(lines[0])==_canonical_option_label(' '.join(lines[1:])):
+    if not value:
+        return ""
+
+    # Clean each line individually so non-breaking or zero-width spaces don't break .strip()
+    lines = [_clean_spaces(line) for line in value.splitlines()]
+    lines = [line for line in lines if line]
+
+    if not lines:
+        return ""
+
+    if len(lines) > 1 and _canonical_option_label(lines[0]) == _canonical_option_label(" ".join(lines[1:])):
         return lines[0]
-    return re.sub(r'\s+',' ',value.replace('\xa0',' ')).strip()
+
+    return " ".join(lines)
 
 
 def normalize_option_label(value: str) -> str:
@@ -80,6 +102,7 @@ READ_PAGE = r'''({scope, prefix, assign}) => {
             if (assign) el.setAttribute('data-dm-agent', id);
             const api = apiFor(el);
             return {id, selector: '[data-dm-agent="' + id + '"]', label: label(el), kind: el.type === 'radio' ? 'radio_option' : (el.classList.contains('mq-editable-field') ? 'mathquill' : (el.tagName === 'SELECT' ? 'select' : 'text')), options: el.tagName === 'SELECT' ? [...el.options].map(x=>({label:x.label,value:x.value})).slice(0,30) : [],
+                context: (el.parentElement?.innerText || '').slice(0,500),
                 has_mathquill_api: !!api, value: api && typeof api.latex === 'function' ? api.latex() :
                     ('value' in el ? el.value : el.innerText)};
         });

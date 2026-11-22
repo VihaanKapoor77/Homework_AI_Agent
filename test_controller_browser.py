@@ -36,6 +36,122 @@ class OfflineControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('observed: 1',output)
         self.assertEqual(await self.page.locator('#answer').input_value(),'2')
         self.assertIn('Previous attempt',await self.ctrl.run('Do that question again'))
+
+    async def test_actual_timed_markup_start_score_and_latex(self):
+        from timed_round import run_timed
+        await self.page.set_content(r'''<main><h1>Rotation and Reflection Rules</h1>
+          <h2>Timed Problem</h2><p id="score">Score: 0/10</p><div role="timer">Current Time: 0.0</div>
+          <button id="start" onclick="startRound()">Start</button>
+          <div class="timed-question-area"><div class="sr-only">Duplicate accessibility prompt</div>
+          <div id="q"></div></div><div class="timed-choices-area"></div></main>
+          <script>let n=0;
+          function math(s){return '<span class="sr-only">spoken math</span><span class="katex"><annotation encoding="application/x-tex">'+s+'</annotation><span>duplicate math</span></span>';}
+          function render(){document.querySelector('#q').innerHTML='Rotation '+math('270^{\\circ}')+' counterclockwise around the origin of the point '+math('(-2,'+(4+n)+')');
+            document.querySelector('.timed-choices-area').innerHTML='<button onclick="correct()">'+math('('+(4+n)+',2)')+'</button><button>(99,99)</button>';}
+          function startRound(){document.querySelector('#start').textContent='Stop';render();}
+          function correct(){n++;document.querySelector('#score').textContent='Score: '+n+'/10';
+            document.querySelector('[role=timer]').textContent='Current Time: '+(n/10).toFixed(1);
+            if(n<10)render();}
+          setInterval(()=>{document.querySelector('[role=timer]').dataset.tick=Date.now()},10);
+          </script>''')
+        result=await run_timed(self.page,self.ctrl.journal,lambda _:None,True)
+        self.assertIn('10/10',result)
+        self.assertEqual(await self.page.evaluate('n'),10)
+
+    async def test_timed_start_requires_authorization(self):
+        from timed_round import run_timed
+        await self.page.set_content('<main>Rotation and Reflection Rules Timed Problem Score: 0/10<button onclick="this.remove()">Start</button></main>')
+        result=await run_timed(self.page,self.ctrl.journal,lambda _:None,False)
+        self.assertIn('not started',result)
+        self.assertEqual(await self.page.get_by_role('button',name='Start').count(),1)
+
+    async def test_ten_point_choices_without_model_or_screenshot(self):
+        import time
+        await self.page.set_content('''<main><p id="question"></p><div id="answer-block">
+            <button id="answer" onclick="answer()"></button><button>(99,99)</button>
+            </div><div role="status"></div></main><script>
+            let n=0;
+            function render(){document.querySelector('#question').textContent=
+              'Reflection over the line y = x of the point ('+(-5-n)+', 2)';
+              document.querySelector('#answer').textContent='(2, '+(-5-n)+')';}
+            function answer(){n++;document.querySelector('[role=status]').textContent='Correct! Question '+n;
+              if(n<10)render();}
+            render();</script>''')
+        self.ctrl.ask=AsyncMock(side_effect=AssertionError('No model calls for exact point choices'))
+        with patch.object(self.page,'screenshot',AsyncMock(side_effect=AssertionError('No screenshots needed'))):
+            started=time.monotonic()
+            output=await self.ctrl.run('Solve 10 questions')
+        self.assertIn('observed: 10',output)
+        self.assertLess(time.monotonic()-started,100)
+        self.assertEqual(await self.page.evaluate('n'),10)
+
+    async def test_point_button_does_not_click_without_submission_permission(self):
+        await self.page.set_content('''<main><p>Reflection over the line y = x of the point (-5, 2)</p>
+          <button onclick="this.textContent='clicked'">(2, -5)</button><button>(-2, 5)</button></main>''')
+        output=await self.ctrl.run('Solve this question but do not submit')
+        self.assertIn('Not clicked',output)
+        self.assertEqual(await self.page.get_by_role('button',name='(2, -5)',exact=True).count(),1)
+
+    async def test_point_button_stale_feedback_is_not_acceptance(self):
+        await self.page.set_content('''<main><p>Reflection over the line y = x of the point (-5, 2)</p>
+          <button onclick="document.querySelector('p').textContent='Reflection over the line y = x of the point (-6, 2)'">(2, -5)</button>
+          <button>(-2, 5)</button><div role="status">Correct!</div></main>''')
+        output=await self.ctrl.run('Solve 10 questions')
+        self.assertIn('acceptance is unconfirmed',output)
+        self.assertNotIn('Website acceptance observed',output)
+
+    async def test_observation_includes_graph_when_scrolled_to_answer(self):
+        import struct
+        await self.page.set_viewport_size({'width':800,'height':400})
+        await self.page.set_content('<main><p>Graph question</p><svg style="display:block" height="500"></svg><input style="display:block;margin-top:500px"></main>')
+        await self.page.locator('input').scroll_into_view_if_needed()
+        _, _, pixels = await self.ctrl.observe(self.page)
+        width, height = struct.unpack('>II', pixels[16:24])
+        self.assertEqual(width,800)
+        self.assertGreater(height,1000)
+
+    async def test_reflection_dilation_dynamic_fields_end_to_end(self):
+        points=[(1,-2),(4,-1),(5,-6),(4,-5),(2,-5),(-2,-4),(-8,-2),(-10,-12),(-8,-10),(-4,-10)]
+        alt=' '.join(f'left parenthesis, {x}, comma, {y}, right parenthesis' for x,y in points)
+        await self.page.set_content('''<main><p>Determine a series of transformations</p>
+          <svg role="img" aria-label="'''+alt+'''"></svg>
+          A <select aria-label="select the first transformation" onchange="document.querySelector('#first').innerHTML='<span>over the <select><option></option><option>x-axis</option><option>y-axis</option></select></span>'">
+          <option></option><option>reflection</option><option>rotation</option></select><span id="first"></span>
+          followed by a <select aria-label="select the second transformation" onchange="document.querySelector('#second').innerHTML='<span>centered at the origin with a scale factor of <input></span>'">
+          <option></option><option>dilation</option><option>translation</option></select><span id="second"></span>
+          <button onclick="document.querySelector('[role=status]').textContent=(document.querySelector('#first select').value==='y-axis' &amp;&amp; document.querySelector('#second input').value==='2'?'Correct!':'Incorrect')">Submit Answer</button><div role="status"></div></main>''')
+        self.ctrl.ask=AsyncMock(side_effect=AssertionError('Exact coordinates must avoid model guessing'))
+        result=await self.ctrl.run('Solve exactly one question')
+        self.assertIn('Website acceptance observed',result)
+        self.assertEqual(await self.page.locator('#first select').input_value(),'y-axis')
+        self.assertEqual(await self.page.locator('#second input').input_value(),'2')
+
+    async def test_rigid_rotation_dropdown_choices_end_to_end(self):
+        import json
+        from composition_math import apply_step
+        source=[(1,2),(4,1),(5,6),(2,5)]
+        for angle in ('90','180','270'):
+            for direction in ('up','down','left','right'):
+                with self.subTest(angle=angle,direction=direction):
+                    steps=[['rotation',angle],['translation',direction,'3']]
+                    target=[apply_step(apply_step(p,steps[0]),steps[1]) for p in source]
+                    alt=' '.join(f'left parenthesis, {x}, comma, {y}, right parenthesis' for x,y in source+target)
+                    await self.page.set_content('''<main><p>Determine a series of transformations</p>
+                    <svg role="img"></svg>A
+                    <select aria-label="select the first transformation" onchange="document.querySelector('#first').innerHTML=rotation">
+                    <option></option><option>rotation</option></select><span id="first"></span>
+                    followed by a <select aria-label="select the second transformation" onchange="document.querySelector('#second').innerHTML=translation">
+                    <option></option><option>translation</option></select><span id="second"></span>
+                    <button onclick="document.querySelector('[role=status]').textContent=(document.querySelector('#first select').value===expectedRotation &amp;&amp; document.querySelector('#second select').value===expectedDirection &amp;&amp; document.querySelector('#second input').value==='3'?'Correct!':'Incorrect')">Submit Answer</button>
+                    <div role="status"></div></main>''')
+                    await self.page.locator('svg').evaluate('(el,alt)=>el.setAttribute("aria-label",alt)',alt)
+                    rotation='''<span>of <select aria-label="select type of rotation about the origin"><option></option><option value="cw-90">90° clockwise</option><option value="ccw-90">90° counterclockwise</option><option value="cw-180">180° clockwise</option><option value="ccw-180">180° counterclockwise</option></select> about the origin</span>'''
+                    translation='''<span><select><option></option><option>up</option><option>down</option><option>left</option><option>right</option></select><input aria-label="enter number of units translated"> unit(s)</span>'''
+                    await self.page.evaluate('data=>Object.assign(window,data)',dict(rotation=rotation,translation=translation,
+                        expectedRotation={'90':'ccw-90','180':'cw-180','270':'cw-90'}[angle],expectedDirection=direction))
+                    self.ctrl.ask=AsyncMock(side_effect=AssertionError('Exact path must not guess with the model'))
+                    result=await self.ctrl.run('Solve this question')
+                    self.assertIn('Website acceptance observed',result)
     async def test_two_roots_added_and_accepted(self):
         await self.page.set_content('''<main><p>Solve x^2=4</p><div id="answers"><input></div><button onclick="document.querySelector('#answers').insertAdjacentHTML('beforeend','<input>')">Add Solution</button>
         <button onclick="document.querySelector('[role=status]').textContent=(Array.from(document.querySelectorAll('#answers input')).map(x=>x.value).join(',')==='-2,2'?'Correct!':'Incorrect')">Submit</button><div role="status"></div></main>''')

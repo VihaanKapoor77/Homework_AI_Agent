@@ -62,6 +62,27 @@ verification failures, and uncertain submissions can still pause work with a rea
 
 ### Whole-assignment continuation (November 13, 2026)
 
+Transformation reading update (November 19, 2026): composition questions now use
+the graph's accessible vertex coordinates and exact arithmetic to check both
+steps against every corresponding vertex. Supported candidates include rotations,
+axis reflections, origin-centered dilations, and axis translations. The controller
+re-discovers parameter fields after selecting each transformation, so newly shown
+answer controls are not mistaken for a different problem. Unsupported mappings
+pause with a coordinate-verification explanation instead of guessing two dropdowns.
+Planning and verification capture the full page, and model context includes graph
+descriptions. Restart an already-running app to load these changes.
+
+Rigid Motions also uses rotation dropdowns instead of numeric angle inputs. The
+controller maps exact angles to the observed clockwise/counterclockwise labels
+and checks the selected label rather than confusing it with the option's internal
+value. Exact coordinate composition does not require a screenshot to render in a
+minimized browser.
+
+Live validation: Shapes is confirmed complete at 5/5. The repaired controller
+completed all four remaining Rigid Motions questions correctly, from 1/5 to 5/5,
+including 180-degree and 270-degree rotations and reflections over both axes.
+This does not establish whole-assignment completion. See [test results](TEST_RESULTS.md).
+
 Requests such as "Finish the whole thing", "Complete the entire task", and
 "Finish this assignment" now continue across questions and unfinished skills,
 including earlier skills in the sidebar. Explicit single-question/count requests
